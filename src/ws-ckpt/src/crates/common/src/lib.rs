@@ -410,6 +410,15 @@ pub fn parse_duration_secs(s: &str) -> Result<u64, String> {
             ))
         }
     };
+    // Reject values that would overflow i64 when downstream uses chrono::Duration::seconds.
+    if secs > i64::MAX as u64 {
+        return Err(format!(
+            "duration '{}' too large (max supported is {} seconds \u{2248} {} years)",
+            s,
+            i64::MAX,
+            i64::MAX / (365 * 86400),
+        ));
+    }
     Ok(secs)
 }
 
@@ -539,11 +548,30 @@ pub fn load_config_file(path: &Path) -> Result<FileConfig, WsCkptError> {
         Ok(content) => {
             let fc: FileConfig = toml::from_str(&content)
                 .map_err(|e| WsCkptError::Config(format!("parse {}: {}", path.display(), e)))?;
+            validate_file_config(&fc, path)?;
             Ok(fc)
         }
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(FileConfig::default()),
         Err(e) => Err(WsCkptError::Io(e)),
     }
+}
+
+/// Validate numeric ranges in a loaded `FileConfig` so downstream consumers
+/// (e.g. bootstrap's `f64 -> u64` cast on `avail * img_max_percent / 100.0`)
+/// never see NaN/Infinity/out-of-range values.
+fn validate_file_config(fc: &FileConfig, path: &Path) -> Result<(), WsCkptError> {
+    if let Some(loop_cfg) = &fc.backend.btrfs_loop {
+        if let Some(pct) = loop_cfg.img_max_percent {
+            if !pct.is_finite() || !(0.0..=100.0).contains(&pct) {
+                return Err(WsCkptError::Config(format!(
+                    "backend.btrfs-loop.img_max_percent in {}: expected a finite value in 0.0..=100.0 (got {})",
+                    path.display(),
+                    pct
+                )));
+            }
+        }
+    }
+    Ok(())
 }
 
 /// Save config to a TOML file, creating parent directories as needed.
@@ -1406,6 +1434,14 @@ mod tests {
     }
 
     #[test]
+    fn parse_duration_rejects_i64_overflow() {
+        // u64::MAX weeks clearly saturates past i64::MAX and must be rejected
+        // so downstream `chrono::Duration::seconds(secs as i64)` stays safe.
+        let huge = format!("{}w", u64::MAX);
+        assert!(parse_duration_secs(&huge).is_err());
+    }
+
+    #[test]
     fn file_config_empty_toml() {
         let fc: FileConfig = toml::from_str("").unwrap();
         assert_eq!(fc, FileConfig::default());
@@ -1462,6 +1498,35 @@ mod tests {
         std::fs::write(&path, "not = [valid toml {{").unwrap();
         let result = load_config_file(&path);
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn load_config_file_rejects_img_max_percent_out_of_range() {
+        let dir = tempfile::tempdir().unwrap();
+        for bad in ["-1.0", "100.5", "nan", "inf"] {
+            let path = dir.path().join(format!("bad_{}.toml", bad));
+            let toml = format!("[backend.btrfs-loop]\nimg_max_percent = {}\n", bad);
+            std::fs::write(&path, toml).unwrap();
+            let result = load_config_file(&path);
+            assert!(result.is_err(), "{} should be rejected", bad);
+        }
+    }
+
+    #[test]
+    fn load_config_file_accepts_img_max_percent_in_range() {
+        let dir = tempfile::tempdir().unwrap();
+        for good in ["0.0", "40.0", "100.0"] {
+            let path = dir.path().join(format!("good_{}.toml", good));
+            let toml = format!("[backend.btrfs-loop]\nimg_max_percent = {}\n", good);
+            std::fs::write(&path, toml).unwrap();
+            let result = load_config_file(&path);
+            assert!(
+                result.is_ok(),
+                "{} should be accepted, got {:?}",
+                good,
+                result
+            );
+        }
     }
 
     // ── Recover round-trip tests ──
