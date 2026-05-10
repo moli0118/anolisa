@@ -11,6 +11,9 @@
 - **快照列表查询** — 支持 table/json 多格式输出
 - **快照差异对比** — 查看两个快照间的文件变更
 - **运行时状态监控** — 守护进程和工作区健康状态一览
+- **后台自动清理** — daemon 内置 auto-cleanup 调度，可按数量或时间维度保留
+- **TOML 配置热重载** — 以 `/etc/ws-ckpt/config.toml` 为唯一入口，`ws-ckpt reload` 即时生效
+- **容量与数量阈值告警** — 任一工作区快照数超 1000 或文件系统使用率超 90% 时统一告警
 
 ## 项目结构
 
@@ -96,6 +99,8 @@ ws-ckpt cleanup --workspace ~/my-workspace --keep 5
 
 ### 状态与配置
 
+配置以 `/etc/ws-ckpt/config.toml` 为唯一持久化入口（参考模板：`/etc/ws-ckpt/config.toml.sample`）。`ws-ckpt config --<flag>` 会写入该文件并通知 daemon reload，两种方式等价。
+
 ```bash
 # 查看系统状态
 ws-ckpt status --workspace ~/my-workspace
@@ -103,21 +108,31 @@ ws-ckpt status --workspace ~/my-workspace
 # 查看当前配置
 ws-ckpt config
 
-# 修改配置
-ws-ckpt config --set cleanup.keep=10
+# 启用周期性 auto-cleanup
+ws-ckpt config --enable-auto-cleanup
+
+# 按数量或时间维度设置保留策略
+ws-ckpt config --auto-cleanup-keep 10
+ws-ckpt config --auto-cleanup-keep 30d
+
+# 手工修改 config.toml 后热生效
+ws-ckpt reload
 ```
 
 ## 命令总览
 
 | 命令 | 说明 |
 |------|------|
+| `init` | 初始化工作区 |
 | `checkpoint` | 创建快照检查点 |
 | `rollback` | 回滚到指定快照 |
 | `delete` | 删除工作区或单个快照 |
 | `list` | 列出工作区所有快照 |
 | `diff` | 查看两个快照间的文件变更 |
-| `cleanup` | 自动清理旧快照 |
+| `cleanup` | 手动清理旧快照 |
 | `status` | 查看守护进程和工作区状态 |
+| `config` | 查看或修改 daemon 配置（写入 `/etc/ws-ckpt/config.toml`） |
+| `reload` | 通知 daemon 重新加载 `config.toml` |
 
 ## 组件
 

@@ -5,82 +5,28 @@
 ## 快速打包
 
 ```bash
-cd /root/code/ws-checkpoint
-./build-rpm.sh
+cd anolisa/src/ws-ckpt
+bash ./build-rpm.sh
 ```
 
 脚本会自动完成：编译 release 二进制 → 准备 RPM 构建目录 → 调用 rpmbuild 生成 RPM 包。
 
-构建完成后 RPM 包会被复制到 `src/ws-ckpt/target/` 目录下。
+构建完成后 RPM 包会放到 `anolisa/src/ws-ckpt/rpmbuild/RPMS` 目录下。
 
 > **前置依赖**：需要安装 `rpm-build` 包：`yum install -y rpm-build`
 
 ## 安装到系统
 
 ```bash
-rpm -ivh ws-ckpt-0.1.0-1.x86_64.rpm
+rpm -ivh ws-ckpt-0.2.0-1.x86_64.rpm
 ```
 
 安装过程会自动：
+
 - 将 `ws-ckpt` 二进制部署到 `/usr/bin/`
 - 安装 systemd 服务文件到 `/etc/systemd/system/`
 - 创建运行时目录（`/run/ws-ckpt`、`/data/ws-ckpt`、`/mnt/btrfs-workspace`）
 - 执行 `systemctl daemon-reload` 并 `enable` 服务
-
-## 打入 Alinux 4 镜像
-
-### 方法 A：Packer 方式（推荐）
-
-在 Packer 模板的 provisioner 中添加：
-
-```json
-{
-  "type": "shell",
-  "inline": [
-    "rpm -ivh /tmp/ws-ckpt-0.1.0-1.x86_64.rpm",
-    "systemctl enable ws-ckpt"
-  ]
-}
-```
-
-配合 `file` provisioner 先将 RPM 上传到实例：
-
-```json
-{
-  "type": "file",
-  "source": "src/ws-ckpt/target/ws-ckpt-0.1.0-1.x86_64.rpm",
-  "destination": "/tmp/ws-ckpt-0.1.0-1.x86_64.rpm"
-}
-```
-
-### 方法 B：Kickstart 方式
-
-在 Kickstart 文件的 `%post` 段落中安装：
-
-```
-%post
-# 假设 RPM 已放置在可访问的位置（HTTP 服务器或本地目录）
-rpm -ivh http://your-repo-server/ws-ckpt-0.1.0-1.x86_64.rpm
-systemctl enable ws-ckpt
-%end
-```
-
-### 方法 C：直接修改镜像
-
-```bash
-# 1. 挂载镜像
-mkdir -p /mnt/image
-mount -o loop image.raw /mnt/image
-
-# 2. chroot 安装
-cp ws-ckpt-0.1.0-1.x86_64.rpm /mnt/image/tmp/
-chroot /mnt/image rpm -ivh /tmp/ws-ckpt-0.1.0-1.x86_64.rpm
-chroot /mnt/image systemctl enable ws-ckpt
-
-# 3. 清理并卸载
-rm /mnt/image/tmp/ws-ckpt-0.1.0-1.x86_64.rpm
-umount /mnt/image
-```
 
 ## 验证安装
 

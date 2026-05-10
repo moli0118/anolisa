@@ -16,7 +16,7 @@ venv/
 **/*.rs.bk
 
 # Build artifacts
-scripts/rpmbuild/
+rpmbuild/
 *.o
 *.a
 *.so

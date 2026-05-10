@@ -48,7 +48,7 @@ ws-ckpt rollback -w <workspace> -s <snapshot>
 
 `--snapshot`简写 `-s` 接受快照 ID（如 `test`）
 
-`--workspace`简写 `-w`可选，如果 snapshot id 全局唯一无需 `-w`参数，如果跨工作区id重复 必须指定工作区
+`--workspace`简写 `-w`, 工作区路径或 ID
 
 **示例**：
 
@@ -172,6 +172,36 @@ ws-ckpt status
 # 指定工作区
 ws-ckpt status -w ./my-project
 
+```
+
+### 2.8 查看或修改配置
+
+配置以 `/etc/ws-ckpt/config.toml` 为持久化入口，`ws-ckpt config --<flag>` 写入该文件并通知 daemon reload。
+
+```bash
+# 查看当前配置
+ws-ckpt config
+
+# 开/关后台 auto-cleanup
+ws-ckpt config --enable-auto-cleanup
+ws-ckpt config --disable-auto-cleanup
+
+# 保留策略：整数=按数量，时长=按时间（单位 s/m/h/d/w）
+ws-ckpt config --auto-cleanup-keep 10
+ws-ckpt config --auto-cleanup-keep 30d
+
+# 调度 / 健康检查间隔（秒，0 禁用）
+ws-ckpt config --auto-cleanup-interval 3600
+ws-ckpt config --health-check-interval 300
+
+# BtrfsLoop 镜像容量（指定后需要重启 daemon 生效）
+ws-ckpt config --img-size 30 --img-max-percent 40
+```
+
+### 2.9 重新加载配置
+
+```bash
+ws-ckpt reload        # 等价于 systemctl reload ws-ckpt
 ```
 
 ## 典型工作流

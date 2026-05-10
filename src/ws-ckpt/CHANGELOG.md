@@ -1,5 +1,15 @@
 # Changelog
 
+## 0.2.0
+
+- Added auto_cleanup feature and switch
+- Unified config modification entry through the TOML file
+- Added global CLI warning when any workspace>1000 snapshots or filesystem usage>90%
+- Fixed backend detection and daemon state recovery logic
+- Fixed image size configuration not taking effect after daemon restart
+- Removed obsolete fs_warn_threshold_percent parameter
+- Fixed config.toml to ship as a sample file
+
 ## 0.1.0
 
 - Daemon with Unix Socket IPC and Bincode binary protocol.

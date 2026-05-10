@@ -97,5 +97,8 @@ if [ $1 -eq 0 ]; then
 fi
 
 %changelog
+* Sun May 10 2026 ziqi02 <ziqi02@alibaba-inc.com> - 0.2.0-1
+- Added auto_cleanup and diff
+
 * Thu Apr 23 2026 ziqi02 <ziqi02@alibaba-inc.com> - 0.1.0-1
 - Initial release
