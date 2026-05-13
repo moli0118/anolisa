@@ -92,13 +92,6 @@ pub enum BackendPaths {
         /// snapshot subvolume parent directory
         snapshots_root: PathBuf,
     },
-    /// OverlayFs: overlay filesystem backend
-    OverlayFs {
-        /// backend data root directory
-        data_root: PathBuf,
-        /// snapshot parent directory
-        snapshots_root: PathBuf,
-    },
     // Future: DmThin { pool_device: PathBuf, thin_id: u32, data_root: PathBuf, snapshots_root: PathBuf }
 }
 

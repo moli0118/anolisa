@@ -7,7 +7,6 @@ use std::path::PathBuf;
 pub enum BackendType {
     BtrfsLoop, // btrfs on a loop device (current implementation)
     BtrfsBase, // native btrfs partition / subvolume
-    OverlayFs, // OverlayFS + XFS reflink (reserved)
 }
 
 impl std::fmt::Display for BackendType {
@@ -15,7 +14,6 @@ impl std::fmt::Display for BackendType {
         match self {
             BackendType::BtrfsLoop => write!(f, "btrfs-loop"),
             BackendType::BtrfsBase => write!(f, "btrfs-base"),
-            BackendType::OverlayFs => write!(f, "overlayfs"),
         }
     }
 }
@@ -27,7 +25,7 @@ pub struct CleanupResult {
     pub kept: usize,          // number of snapshots retained
 }
 
-/// GC result (overlayfs generation cleanup; no-op on btrfs backends)
+/// GC result (generation cleanup)
 #[derive(Debug, Default, Serialize, Deserialize)]
 pub struct GcResult {
     pub generations_removed: usize,
@@ -99,10 +97,10 @@ pub trait StorageBackend: Send + Sync {
         snapshot_ids: &[String],
     ) -> anyhow::Result<Vec<String>>;
 
-    /// Fork an independent workspace from a snapshot (reserved overlayfs API)
+    /// Fork an independent workspace from a snapshot (reserved)
     async fn fork(&self, ws_id: &str, snapshot_id: &str, new_ws_id: &str) -> anyhow::Result<()>;
 
-    /// Clean up old generations (reserved overlayfs API, no-op on btrfs backends)
+    /// Clean up old generations (reserved)
     async fn gc_generations(&self, ws_id: &str) -> anyhow::Result<GcResult>;
 
     /// Environment check

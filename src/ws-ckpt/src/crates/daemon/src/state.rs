@@ -199,10 +199,6 @@ impl DaemonState {
                 data_root: self.backend.data_root().to_path_buf(),
                 snapshots_root: self.backend.snapshots_root().to_path_buf(),
             },
-            BackendType::OverlayFs => BackendPaths::OverlayFs {
-                data_root: self.backend.data_root().to_path_buf(),
-                snapshots_root: self.backend.snapshots_root().to_path_buf(),
-            },
         };
         let state_file = DaemonStateFile::new(
             DAEMON_STATE_VERSION,

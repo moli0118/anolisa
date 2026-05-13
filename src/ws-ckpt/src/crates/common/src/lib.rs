@@ -459,7 +459,7 @@ pub struct DaemonConfig {
     pub auto_cleanup_interval_secs: u64,
     /// Interval in seconds between health checks
     pub health_check_interval_secs: u64,
-    /// Backend type string from config: "auto" | "btrfs-base" | "btrfs-loop" | "overlayfs"
+    /// Backend type string from config: "auto" | "btrfs-base" | "btrfs-loop"
     pub backend_type: String,
     /// Loop image file path (runtime-only; always `BTRFS_IMG_PATH`, not user-configurable)
     pub img_path: String,
@@ -481,7 +481,6 @@ impl DaemonConfig {
         match self.backend_type.as_str() {
             "btrfs-loop" => Some(BackendType::BtrfsLoop),
             "btrfs-base" => Some(BackendType::BtrfsBase),
-            "overlayfs" => Some(BackendType::OverlayFs),
             _ => None, // "auto" or unknown → auto-detect
         }
     }
@@ -517,7 +516,7 @@ pub struct BtrfsLoopConfig {
 /// Backend configuration section in config file.
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
 pub struct BackendConfig {
-    /// "auto" | "btrfs-base" | "btrfs-loop" | "overlayfs"
+    /// "auto" | "btrfs-base" | "btrfs-loop"
     #[serde(default = "default_backend_type")]
     pub r#type: String,
     /// BtrfsLoop backend-specific settings

@@ -10,7 +10,6 @@ use ws_ckpt_common::DaemonConfig;
 use crate::backends::btrfs_base::{BtrfsBaseBackend, BtrfsBaseScenario};
 use crate::backends::btrfs_common;
 use crate::backends::btrfs_loop::BtrfsLoopBackend;
-use crate::backends::overlayfs::OverlayFsBackend;
 
 /// Result of backend detection, including the backend instance and how it was chosen.
 pub struct DetectResult {
@@ -111,15 +110,6 @@ pub(crate) async fn create_backend(
                 mount_info.mount_point, scenario
             );
             let backend = BtrfsBaseBackend::new(PathBuf::from(&mount_info.mount_point), scenario);
-            Ok(Arc::new(backend))
-        }
-        BackendType::OverlayFs => {
-            let data_root = PathBuf::from("/data/agent_workspace");
-            info!(
-                "Creating OverlayFs backend: data_root={}",
-                data_root.display()
-            );
-            let backend = OverlayFsBackend::new(data_root);
             Ok(Arc::new(backend))
         }
     }

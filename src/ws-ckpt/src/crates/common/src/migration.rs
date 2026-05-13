@@ -155,10 +155,6 @@ pub fn migrate_legacy_indexes(backend: &dyn StorageBackend, state_dir: &Path) ->
                     data_root: backend.data_root().to_path_buf(),
                     snapshots_root: backend.snapshots_root().to_path_buf(),
                 },
-                crate::backend::BackendType::OverlayFs => BackendPaths::OverlayFs {
-                    data_root: backend.data_root().to_path_buf(),
-                    snapshots_root: backend.snapshots_root().to_path_buf(),
-                },
             },
             workspaces: workspace_entries,
         };
