@@ -52,26 +52,26 @@ def _get_manager() -> CheckpointManager:
 # subvolume symlink, then later snapshot/rollback recreates it), so any process
 # holding cwd inside the workspace will get ENOENT on the next getcwd(). Refuse
 # instead of silently producing broken state.
-CWD_INSIDE_WORKSPACE_REASON = (
-    "The hosting process's cwd is inside the workspace. "
-    "ws-ckpt replaces the workspace inode during init/checkpoint/rollback, "
-    "which would invalidate the process cwd. "
-    "The user must launch the session from outside the workspace directory."
-)
+def _cwd_inside_workspace_reason(cwd: str, workspace: str) -> str:
+    return (
+        f"Refused: cwd={cwd} is inside workspace={workspace}. "
+        "ws-ckpt replaces the workspace inode during init/checkpoint/rollback, "
+        "which would invalidate the process cwd. "
+        "The user must launch the session from outside the workspace directory."
+    )
 
 
-def _cwd_inside_workspace(workspace: str) -> bool:
-    """Return True when the current cwd is the workspace itself or a descendant."""
+def _cwd_inside_workspace(workspace: str) -> tuple[bool, str]:
+    """Return (inside, cwd) — whether the current cwd is the workspace or a descendant."""
     try:
         cwd = Path(os.getcwd()).resolve()
     except (FileNotFoundError, OSError):
-        # cwd already invalid — caller decides what to do; we can't prove containment.
-        return False
+        return False, ""
     try:
         ws_path = Path(workspace).resolve()
     except (FileNotFoundError, OSError):
-        return False
-    return cwd == ws_path or ws_path in cwd.parents
+        return False, str(cwd)
+    return cwd == ws_path or ws_path in cwd.parents, str(cwd)
 
 
 # ---------------------------------------------------------------------------
@@ -94,11 +94,11 @@ def _on_session_start(session_id: str = "", model: str = "", **_: Any) -> None:
         )
         return
 
-    if _cwd_inside_workspace(manager.config.workspace):
-        # Disable for this session so on_session_end stops trying too.
+    inside, cwd = _cwd_inside_workspace(manager.config.workspace)
+    if inside:
         manager.set_auto_checkpoint(False)
         print(
-            f"[ws-ckpt] Refusing auto-checkpoint: {CWD_INSIDE_WORKSPACE_REASON}",
+            f"[ws-ckpt] Refusing auto-checkpoint: {_cwd_inside_workspace_reason(cwd, manager.config.workspace)}",
             flush=True,
         )
         return

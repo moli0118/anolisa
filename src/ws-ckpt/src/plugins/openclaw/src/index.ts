@@ -19,7 +19,7 @@ import {
   definePluginEntry,
   type OpenClawPluginApi,
 } from "../types-shim.js";
-import { pluginState, cwdInsideWorkspace, CWD_INSIDE_WORKSPACE_REASON } from "./state.js";
+import { pluginState, cwdInsideWorkspace, cwdInsideWorkspaceReason } from "./state.js";
 import { registerTools } from "./tool-registry.js";
 import { registerHooks } from "./hooks.js";
 import { ensureToolsAlsoAllow } from "./whitelist.js";
@@ -83,9 +83,10 @@ function register(api: OpenClawPluginApi): void {
       return;
     }
 
-    if (cwdInsideWorkspace(config.workspace)) {
+    const cwdCheck = cwdInsideWorkspace(config.workspace);
+    if (cwdCheck.inside) {
       pluginState.environmentReady = false;
-      console.warn(`[ws-ckpt] Refusing: ${CWD_INSIDE_WORKSPACE_REASON}`);
+      console.warn(`[ws-ckpt] Refusing: ${cwdInsideWorkspaceReason(cwdCheck.cwd, config.workspace)}`);
     } else {
       try {
         const ok = await pluginState.manager!.ensureWorkspace(config.workspace);

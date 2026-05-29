@@ -56,12 +56,13 @@ def _require_workspace() -> Tuple[str, Optional[str]]:
 
 def _reject_if_cwd_inside_workspace(workspace: str) -> Optional[str]:
     """Return a serialized error response when cwd is inside workspace, else None."""
-    from . import CWD_INSIDE_WORKSPACE_REASON, _cwd_inside_workspace  # lazy
+    from . import _cwd_inside_workspace, _cwd_inside_workspace_reason  # lazy
 
-    if _cwd_inside_workspace(workspace):
+    inside, cwd = _cwd_inside_workspace(workspace)
+    if inside:
         return _json({
             "success": False,
-            "error": CWD_INSIDE_WORKSPACE_REASON,
+            "error": _cwd_inside_workspace_reason(cwd, workspace),
             "retryable": False,
         })
     return None

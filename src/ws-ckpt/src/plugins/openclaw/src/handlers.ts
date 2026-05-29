@@ -8,7 +8,7 @@
 import { CommandExecutor } from "./commands.js";
 import { mapErrorToLLMMessage } from "./btrfs-manager.js";
 import type { AgentToolResult } from "../types-shim.js";
-import { pluginState, UNAVAILABLE_MSG, cwdInsideWorkspace, CWD_INSIDE_WORKSPACE_REASON } from "./state.js";
+import { pluginState, UNAVAILABLE_MSG, cwdInsideWorkspace, cwdInsideWorkspaceReason } from "./state.js";
 import { daemonAutoCleanup } from "./config.js";
 
 // ---------------------------------------------------------------------------
@@ -47,8 +47,9 @@ export async function handleCheckpoint(
   // Explicit workspace bypasses the manager (and its workspace-bound cache),
   // mirroring the handleDelete pattern.
   if (explicitWs) {
-    if (cwdInsideWorkspace(explicitWs)) {
-      return { text: CWD_INSIDE_WORKSPACE_REASON, isError: true };
+    const cwdCheck = cwdInsideWorkspace(explicitWs);
+    if (cwdCheck.inside) {
+      return { text: cwdInsideWorkspaceReason(cwdCheck.cwd, explicitWs), isError: true };
     }
     try {
       const executor = new CommandExecutor();
@@ -67,8 +68,11 @@ export async function handleCheckpoint(
   }
 
   const ws = pluginState.resolvedConfig?.workspace;
-  if (ws && cwdInsideWorkspace(ws)) {
-    return { text: CWD_INSIDE_WORKSPACE_REASON, isError: true };
+  if (ws) {
+    const cwdCheck = cwdInsideWorkspace(ws);
+    if (cwdCheck.inside) {
+      return { text: cwdInsideWorkspaceReason(cwdCheck.cwd, ws), isError: true };
+    }
   }
 
   const result = await pluginState.manager.createCheckpoint({
@@ -98,8 +102,9 @@ export async function handleRollback(
 
   const explicitWs = workspace?.trim();
   if (explicitWs) {
-    if (cwdInsideWorkspace(explicitWs)) {
-      return { text: CWD_INSIDE_WORKSPACE_REASON, isError: true };
+    const cwdCheck = cwdInsideWorkspace(explicitWs);
+    if (cwdCheck.inside) {
+      return { text: cwdInsideWorkspaceReason(cwdCheck.cwd, explicitWs), isError: true };
     }
     try {
       const executor = new CommandExecutor();
@@ -115,8 +120,11 @@ export async function handleRollback(
   }
 
   const ws = pluginState.resolvedConfig?.workspace;
-  if (ws && cwdInsideWorkspace(ws)) {
-    return { text: CWD_INSIDE_WORKSPACE_REASON, isError: true };
+  if (ws) {
+    const cwdCheck = cwdInsideWorkspace(ws);
+    if (cwdCheck.inside) {
+      return { text: cwdInsideWorkspaceReason(cwdCheck.cwd, ws), isError: true };
+    }
   }
 
   const result = await pluginState.manager.rollback(trimmed);
@@ -323,8 +331,11 @@ export async function handleConfig(
       const coerced = value === "true";
       if (coerced) {
         const ws = pluginState.resolvedConfig.workspace;
-        if (ws && cwdInsideWorkspace(ws)) {
-          return { text: CWD_INSIDE_WORKSPACE_REASON, isError: true };
+        if (ws) {
+          const cwdCheck = cwdInsideWorkspace(ws);
+          if (cwdCheck.inside) {
+            return { text: cwdInsideWorkspaceReason(cwdCheck.cwd, ws), isError: true };
+          }
         }
       }
       pluginState.resolvedConfig.autoCheckpoint = coerced;

@@ -9,7 +9,7 @@
 import crypto from "node:crypto";
 import type { OpenClawPluginApi, PluginHookMessageReceivedEvent } from "../types-shim.js";
 import type { PluginConfig } from "./types.js";
-import { pluginState, cwdInsideWorkspace, CWD_INSIDE_WORKSPACE_REASON } from "./state.js";
+import { pluginState, cwdInsideWorkspace, cwdInsideWorkspaceReason } from "./state.js";
 import { mapErrorToLLMMessage } from "./btrfs-manager.js";
 
 // ---------------------------------------------------------------------------
@@ -55,9 +55,10 @@ export function registerHooks(api: OpenClawPluginApi, config: PluginConfig): voi
     if (!pluginState.manager || !pluginState.environmentReady) return;
 
     const workspace = pluginState.resolvedConfig?.workspace;
-    if (workspace && cwdInsideWorkspace(workspace)) {
+    const cwdCheckEnd = workspace ? cwdInsideWorkspace(workspace) : undefined;
+    if (cwdCheckEnd?.inside) {
       config.autoCheckpoint = false;
-      console.warn(`[ws-ckpt] Disabling auto-checkpoint: ${CWD_INSIDE_WORKSPACE_REASON}`);
+      console.warn(`[ws-ckpt] Disabling auto-checkpoint: ${cwdInsideWorkspaceReason(cwdCheckEnd.cwd, workspace!)}`);
     } else {
       const snapshotId = crypto.randomUUID().slice(0, 8);
       const message = tracker.getLastUserMessage() ?? "turn end";
@@ -87,9 +88,10 @@ export function registerHooks(api: OpenClawPluginApi, config: PluginConfig): voi
     const workspace = pluginState.resolvedConfig?.workspace;
     if (!pluginState.manager || !pluginState.environmentReady || !workspace) return;
 
-    if (cwdInsideWorkspace(workspace)) {
+    const cwdCheckStart = cwdInsideWorkspace(workspace);
+    if (cwdCheckStart.inside) {
       config.autoCheckpoint = false;
-      console.warn(`[ws-ckpt] Disabling auto-checkpoint: ${CWD_INSIDE_WORKSPACE_REASON}`);
+      console.warn(`[ws-ckpt] Disabling auto-checkpoint: ${cwdInsideWorkspaceReason(cwdCheckStart.cwd, workspace)}`);
     } else {
       try {
         await pluginState.manager.initialize(workspace);

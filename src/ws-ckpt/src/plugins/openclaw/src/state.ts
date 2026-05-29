@@ -36,20 +36,23 @@ export const pluginState = {
 export const UNAVAILABLE_MSG =
   "ws-ckpt plugin is not available. Run environment check for details.";
 
-export const CWD_INSIDE_WORKSPACE_REASON =
-  "The hosting process's cwd is inside the workspace. " +
-  "ws-ckpt replaces the workspace inode during init/checkpoint/rollback, " +
-  "which would invalidate the process cwd. " +
-  "This is NOT retryable — do NOT call any ws-ckpt tool again in this session. " +
-  "The user must launch the session from outside the workspace directory.";
+export function cwdInsideWorkspaceReason(cwd: string, workspace: string): string {
+  return (
+    `Refused: cwd=${cwd} is inside workspace=${workspace}. ` +
+    "ws-ckpt replaces the workspace inode during init/checkpoint/rollback, " +
+    "which would invalidate the process cwd. " +
+    "This is NOT retryable — do NOT call any ws-ckpt tool again in this session. " +
+    "The user must launch the session from outside the workspace directory."
+  );
+}
 
-export function cwdInsideWorkspace(workspace: string): boolean {
+export function cwdInsideWorkspace(workspace: string): { inside: boolean; cwd: string } {
   let cwd: string;
   try {
     cwd = path.resolve(process.cwd());
   } catch {
-    return false;
+    return { inside: false, cwd: "" };
   }
   const ws = path.resolve(workspace);
-  return cwd === ws || cwd.startsWith(ws + path.sep);
+  return { inside: cwd === ws || cwd.startsWith(ws + path.sep), cwd };
 }
