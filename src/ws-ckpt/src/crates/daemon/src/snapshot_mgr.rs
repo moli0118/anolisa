@@ -1,13 +1,125 @@
 use std::sync::Arc;
 
 use anyhow::Context;
+use tokio::sync::RwLock;
 use tracing::info;
 use ws_ckpt_common::{ErrorCode, ResolveError, Response, SnapshotEntry, SnapshotMeta};
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use crate::index_store;
-use crate::state::DaemonState;
+use crate::state::{DaemonState, WorkspaceState};
+
+/// Result of [`delete_snapshots_locked`]: per-snap outcome, no early bail
+/// (caller decides whether failures escalate to an error or just warn).
+pub struct CleanupOutcome {
+    pub removed: Vec<String>,
+    pub failed: Vec<(String, String)>,
+}
+
+/// Shared per-snap detach-then-delete loop, used by both
+/// [`cleanup_snapshots`] (user-triggered Count cleanup) and the scheduler's
+/// background pass. Invariants:
+///
+/// 1. **detach under write lock, delete unlocked** — a concurrent pin RPC
+///    either wins (we skip) or loses (it sees SnapshotNotFound). No
+///    read→fs window where pin sneaks in between recheck and delete.
+/// 2. **per-snap try/recover** — on backend Err the meta is re-inserted so
+///    the index stays in sync with on-disk subvolumes.
+/// 3. **no short-circuit** — earlier successes must persist even if a later
+///    snap fails; the caller persists `index` + manifest from
+///    `outcome.removed`. An early `?` would lose the prior in-memory removes.
+///
+/// `label` ("cleanup" / "auto-cleanup") prefixes log lines.
+pub async fn delete_snapshots_locked(
+    state: &DaemonState,
+    arc: &Arc<RwLock<WorkspaceState>>,
+    ws_id: &str,
+    to_remove: &[String],
+    label: &str,
+) -> CleanupOutcome {
+    let mut removed = Vec::new();
+    let mut failed: Vec<(String, String)> = Vec::new();
+    for snap_id in to_remove {
+        let detached = {
+            let mut ws = arc.write().await;
+            match ws.index.snapshots.get(snap_id) {
+                Some(m) if !m.pinned => ws.index.snapshots.remove(snap_id),
+                _ => None,
+            }
+        };
+        let Some(meta) = detached else { continue };
+
+        match state
+            .backend
+            .cleanup_snapshots(ws_id, std::slice::from_ref(snap_id))
+            .await
+        {
+            Ok(deleted) if deleted.is_empty() => {
+                // Backend reported no-op (already gone); roll back the detach
+                // so the index doesn't drift.
+                arc.write()
+                    .await
+                    .index
+                    .snapshots
+                    .insert(snap_id.clone(), meta);
+            }
+            Ok(_) => {
+                info!("{}: removed snapshot {}", label, snap_id);
+                removed.push(snap_id.clone());
+            }
+            Err(e) => {
+                arc.write()
+                    .await
+                    .index
+                    .snapshots
+                    .insert(snap_id.clone(), meta);
+                tracing::warn!("{}: backend delete failed for {}: {:#}", label, snap_id, e);
+                failed.push((snap_id.clone(), format!("{:#}", e)));
+            }
+        }
+    }
+    CleanupOutcome { removed, failed }
+}
+
+/// After [`delete_snapshots_locked`] succeeded for ≥1 snap, snapshot the
+/// in-memory index outside the lock and persist to `index.json` + manifest.
+/// Both writes are best-effort and warn-only — by the time we get here the
+/// subvolumes are already gone, so an index-save failure just means restart
+/// will rebuild from fs (cheap), and a manifest failure leaves stale entries
+/// but the ws is still usable.
+pub async fn persist_index_after_cleanup(
+    state: &DaemonState,
+    arc: &Arc<RwLock<WorkspaceState>>,
+    snap_dir: &Path,
+    label: &str,
+) {
+    let index_to_persist = {
+        let ws = arc.read().await;
+        ws.index.clone()
+    };
+    if let Err(e) = index_store::save(snap_dir, &index_to_persist).await {
+        tracing::warn!("{}: failed to save index: {:#}", label, e);
+    }
+    if let Err(e) = state.save_manifest().await {
+        tracing::warn!("{}: save_manifest failed: {:#}", label, e);
+    }
+}
+
+/// Ensure `dir` exists; warn-only because every caller is in a per-ws loop
+/// that should continue to the next ws on a single-dir mkdir failure.
+pub async fn ensure_index_dir(dir: &PathBuf, label: &str) -> bool {
+    if let Err(e) = tokio::fs::create_dir_all(dir).await {
+        tracing::warn!(
+            "{}: failed to create index directory {:?}: {}",
+            label,
+            dir,
+            e
+        );
+        return false;
+    }
+    true
+}
 
 fn workspace_not_found(workspace: &str) -> Response {
     Response::Error {
@@ -302,58 +414,55 @@ pub async fn cleanup_snapshots(
         None => return Ok(workspace_not_found(workspace)),
     };
 
-    let mut ws = arc.write().await;
-    let snap_dir = state.index_dir(&ws.ws_id);
-    // Ensure index directory exists
+    // P1: plan under write lock — pure in-memory work, no fs I/O.
+    let (ws_id, to_remove_ids, snap_dir) = {
+        let ws = arc.write().await;
+        let ws_id = ws.ws_id.clone();
+        let snap_dir = state.index_dir(&ws_id);
+
+        let mut unpinned: Vec<(String, chrono::DateTime<chrono::Utc>)> = ws
+            .index
+            .snapshots
+            .iter()
+            .filter(|(_, meta)| !meta.pinned)
+            .map(|(id, meta)| (id.clone(), meta.created_at))
+            .collect();
+        unpinned.sort_by_key(|(_, ts)| *ts);
+
+        let to_remove_ids: Vec<String> = if unpinned.len() > keep {
+            unpinned[..unpinned.len() - keep]
+                .iter()
+                .map(|(id, _)| id.clone())
+                .collect()
+        } else {
+            Vec::new()
+        };
+
+        (ws_id, to_remove_ids, snap_dir)
+    };
+
+    // P1.5: create index dir unlocked (slow fs must not block the ws write lock).
     tokio::fs::create_dir_all(&snap_dir)
         .await
         .with_context(|| format!("Failed to create index dir: {:?}", snap_dir))?;
 
-    // Collect non-pinned snapshots, sorted by created_at ascending (oldest first)
-    let mut unpinned: Vec<(String, chrono::DateTime<chrono::Utc>)> = ws
-        .index
-        .snapshots
-        .iter()
-        .filter(|(_, meta)| !meta.pinned)
-        .map(|(id, meta)| (id.clone(), meta.created_at))
-        .collect();
-    unpinned.sort_by_key(|(_, ts)| *ts);
-
-    // Determine which to remove (oldest beyond keep count)
-    let to_remove = if unpinned.len() > keep {
-        unpinned[..unpinned.len() - keep].to_vec()
-    } else {
-        vec![]
-    };
-
-    let to_remove_ids: Vec<String> = to_remove.iter().map(|(id, _)| id.clone()).collect();
-    let removed = state
-        .backend
-        .cleanup_snapshots(&ws.ws_id, &to_remove_ids)
-        .await?;
-
-    // Update index for actually removed snapshots
-    for snap_id in &removed {
-        ws.index.snapshots.remove(snap_id);
-        info!("cleanup: removed snapshot {}", snap_id);
+    // P2: detach-then-delete (shared helper); persist (shared helper).
+    let outcome = delete_snapshots_locked(state, &arc, &ws_id, &to_remove_ids, "cleanup").await;
+    if !outcome.removed.is_empty() {
+        persist_index_after_cleanup(state, &arc, &snap_dir, "cleanup").await;
     }
-
-    // Save index if any were removed
-    if !removed.is_empty() {
-        index_store::save(&snap_dir, &ws.index).await?;
+    if !outcome.failed.is_empty() {
+        // User-triggered → surface partial failure as Err so the CLI exits non-zero.
+        anyhow::bail!(
+            "cleanup_snapshots: deleted {}/{}, failed: {:?}",
+            outcome.removed.len(),
+            to_remove_ids.len(),
+            outcome.failed
+        );
     }
-
-    // Release write lock before save_manifest (try_read inside
-    // collect_workspace_entries would fail while write lock is held)
-    drop(ws);
-
-    if !removed.is_empty() {
-        if let Err(e) = state.save_manifest().await {
-            tracing::warn!("save_manifest failed after cleanup_snapshots: {:#}", e);
-        }
-    }
-
-    Ok(Response::CleanupOk { removed })
+    Ok(Response::CleanupOk {
+        removed: outcome.removed,
+    })
 }
 
 #[cfg(test)]
@@ -874,5 +983,163 @@ mod tests {
             }
             other => panic!("expected SnapshotNotFound, got: {:?}", other),
         }
+    }
+
+    // ── cleanup_snapshots partial-failure tests ──
+    //
+    // Backstop for the "no early `?` in the delete loop" invariant
+    // (delete_snapshots_locked): if backend.cleanup_snapshots succeeds for
+    // snaps A,B,C then fails for D, the index must still have A/B/C removed
+    // (and persisted) and D rolled back to its previous meta. The caller
+    // (cleanup_snapshots) then bails with a count summary so the CLI exits
+    // non-zero. Without the shared helper or with an early `?`, prior
+    // in-memory removes would be lost.
+
+    struct PartialFailBackend {
+        data_root: PathBuf,
+        snapshots_root: PathBuf,
+        fail_ids: std::collections::HashSet<String>,
+    }
+
+    impl PartialFailBackend {
+        fn new(fail_ids: impl IntoIterator<Item = String>) -> Self {
+            Self {
+                data_root: PathBuf::from("/tmp/pfb-data"),
+                snapshots_root: PathBuf::from("/tmp/pfb-snaps"),
+                fail_ids: fail_ids.into_iter().collect(),
+            }
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl StorageBackend for PartialFailBackend {
+        fn backend_type(&self) -> ws_ckpt_common::backend::BackendType {
+            ws_ckpt_common::backend::BackendType::BtrfsBase
+        }
+        fn data_root(&self) -> &std::path::Path {
+            &self.data_root
+        }
+        fn snapshots_root(&self) -> &std::path::Path {
+            &self.snapshots_root
+        }
+        async fn cleanup_snapshots(
+            &self,
+            _ws_id: &str,
+            snapshot_ids: &[String],
+        ) -> anyhow::Result<Vec<String>> {
+            // Single-snap calls only (matches snapshot_mgr's per-snap loop).
+            let id = snapshot_ids
+                .first()
+                .expect("PartialFailBackend expects per-snap calls");
+            if self.fail_ids.contains(id) {
+                anyhow::bail!("simulated backend failure for {}", id);
+            }
+            Ok(vec![id.clone()])
+        }
+        // Everything else: panic if hit — keeps the test honest about which
+        // backend methods cleanup actually exercises.
+        async fn init_workspace(
+            &self,
+            _: &str,
+            _: &str,
+        ) -> anyhow::Result<ws_ckpt_common::WorkspaceInfo> {
+            unimplemented!()
+        }
+        async fn create_snapshot(&self, _: &str, _: &str) -> anyhow::Result<()> {
+            unimplemented!()
+        }
+        async fn rollback(&self, _: &str, _: &str) -> anyhow::Result<PathBuf> {
+            unimplemented!()
+        }
+        async fn delete_snapshot(&self, _: &str, _: &str) -> anyhow::Result<()> {
+            unimplemented!()
+        }
+        async fn recover_workspace(&self, _: &str, _: &str) -> anyhow::Result<()> {
+            unimplemented!()
+        }
+        async fn diff(
+            &self,
+            _: &str,
+            _: &str,
+            _: &str,
+        ) -> anyhow::Result<Vec<ws_ckpt_common::DiffEntry>> {
+            unimplemented!()
+        }
+        async fn fork(&self, _: &str, _: &str, _: &str) -> anyhow::Result<()> {
+            unimplemented!()
+        }
+        async fn gc_generations(
+            &self,
+            _: &str,
+        ) -> anyhow::Result<ws_ckpt_common::backend::GcResult> {
+            unimplemented!()
+        }
+        async fn check_environment(
+            &self,
+        ) -> anyhow::Result<ws_ckpt_common::backend::EnvironmentStatus> {
+            unimplemented!()
+        }
+        async fn get_usage(&self) -> anyhow::Result<(u64, u64)> {
+            unimplemented!()
+        }
+    }
+
+    #[tokio::test]
+    async fn cleanup_snapshots_persists_partial_success_and_bails() {
+        // 5 unpinned snapshots, the 3rd fails. Expectation:
+        //   - bail with "deleted 4/5, failed: [snap-3]"
+        //   - in-memory index keeps only snap-3 (others removed)
+        //   - failed snap meta is re-inserted (no detach drift)
+        let tmp = tempfile::tempdir().unwrap();
+        let backend = Arc::new(PartialFailBackend::new(["snap-3".to_string()]));
+        let state = Arc::new(crate::state::DaemonState::new(
+            test_config(),
+            backend as Arc<dyn StorageBackend>,
+            tmp.path().to_path_buf(),
+        ));
+
+        let ws_path = PathBuf::from("/ws/partial-fail");
+        let mut idx = SnapshotIndex::new(ws_path.clone());
+        let now = Utc::now();
+        for (i, off) in [0i64, 1, 2, 3, 4].iter().enumerate() {
+            idx.snapshots.insert(
+                format!("snap-{}", i + 1),
+                make_snapshot_meta_at(false, now - Duration::seconds(*off)),
+            );
+        }
+        state.register_workspace("ws-partial".to_string(), ws_path.clone(), idx);
+
+        // keep=0 → all 5 are removal candidates. cleanup_snapshots returns
+        // Ok(Response) for routing errors (e.g. WorkspaceNotFound) but Err
+        // for partial backend failure — so the user-facing CLI exits non-zero.
+        let result = cleanup_snapshots(&state, "ws-partial", Some(0)).await;
+        let err = result.expect_err("partial failure must bubble up as Err");
+        let msg = format!("{:#}", err);
+        assert!(
+            msg.contains("4/5"),
+            "error should report deleted/total, got: {}",
+            msg
+        );
+        assert!(
+            msg.contains("snap-3"),
+            "error should name the failed id, got: {}",
+            msg
+        );
+
+        // In-memory index: snap-3 stays (re-inserted), others gone.
+        let arc = state
+            .get_by_wsid("ws-partial")
+            .expect("ws still registered");
+        let ws = arc.read().await;
+        assert_eq!(ws.index.snapshots.len(), 1, "only the failed snap remains");
+        assert!(ws.index.snapshots.contains_key("snap-3"));
+
+        // Persisted index reflects the same — earlier successes were saved
+        // even though the caller bailed.
+        let on_disk = crate::index_store::load(&state.index_dir("ws-partial"))
+            .await
+            .expect("index.json saved");
+        assert_eq!(on_disk.snapshots.len(), 1);
+        assert!(on_disk.snapshots.contains_key("snap-3"));
     }
 }
