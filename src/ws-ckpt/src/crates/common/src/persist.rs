@@ -136,32 +136,57 @@ pub fn load_state(state_dir: &Path) -> Result<Option<DaemonStateFile>> {
     }
 }
 
-/// Atomically write to state.json (write-tmp + fsync + rename).
+/// Atomically write `bytes` to `<dir>/<name>` via tmp+fsync+rename+parent-
+/// fsync. Optionally create the temp file with `mode` (Unix only).
 ///
-/// Write flow:
-/// 1. Serialize to JSON (pretty print)
-/// 2. Write to temporary file state.json.tmp
-/// 3. fsync to ensure data is written to disk
-/// 4. rename atomically
-pub fn save_state(state_dir: &Path, state: &DaemonStateFile) -> Result<()> {
-    fs::create_dir_all(state_dir)
-        .with_context(|| format!("Failed to create state directory: {}", state_dir.display()))?;
+/// Crash semantics: after Ok the target holds the new content — never a
+/// half-written file. The parent-dir fsync is best-effort: it runs *after*
+/// the rename already succeeded, so propagating its error would
+/// leave the file durably on disk while memory rejects the update, causing
+/// memory-vs-disk drift. We log it at `warn!` instead.
+///
+/// `mode` is applied both via `OpenOptions::mode()` at create time AND via
+/// an explicit `fchmod` on the open handle. The fchmod is required because
+/// `create(true).truncate(true)` reuses the inode of a stale `<name>.tmp`
+/// left by a crashed prior write, inheriting its old (possibly 0o644)
+/// permissions — `OpenOptions::mode()` only fires on a fresh create.
+/// Ignored on non-Unix.
+pub fn atomic_write(
+    dir: &Path,
+    name: &str,
+    bytes: &[u8],
+    #[cfg_attr(not(unix), allow(unused_variables))] mode: Option<u32>,
+) -> Result<()> {
+    fs::create_dir_all(dir)
+        .with_context(|| format!("Failed to create directory: {}", dir.display()))?;
 
-    let target = state_dir.join(STATE_FILE);
-    let tmp = state_dir.join(format!("{}.tmp", STATE_FILE));
+    let target = dir.join(name);
+    let tmp = dir.join(format!("{}.tmp", name));
 
-    let content =
-        serde_json::to_string_pretty(state).context("Failed to serialize DaemonStateFile")?;
+    {
+        let mut opts = fs::OpenOptions::new();
+        opts.write(true).create(true).truncate(true);
+        #[cfg(unix)]
+        if let Some(m) = mode {
+            use std::os::unix::fs::OpenOptionsExt;
+            opts.mode(m);
+        }
+        let mut file = opts
+            .open(&tmp)
+            .with_context(|| format!("Failed to create temp file: {}", tmp.display()))?;
+        // fchmod even if file pre-existed: OpenOptions::mode() only applies on create.
+        #[cfg(unix)]
+        if let Some(m) = mode {
+            use std::os::unix::fs::PermissionsExt;
+            file.set_permissions(fs::Permissions::from_mode(m))
+                .with_context(|| format!("Failed to chmod temp file: {}", tmp.display()))?;
+        }
+        file.write_all(bytes)
+            .with_context(|| format!("Failed to write temp file: {}", tmp.display()))?;
+        file.sync_all()
+            .with_context(|| format!("Failed to fsync temp file: {}", tmp.display()))?;
+    }
 
-    // Write to temporary file
-    let mut file = fs::File::create(&tmp)
-        .with_context(|| format!("Failed to create temp file: {}", tmp.display()))?;
-    file.write_all(content.as_bytes())
-        .with_context(|| format!("Failed to write temp file: {}", tmp.display()))?;
-    file.sync_all()
-        .with_context(|| format!("Failed to fsync temp file: {}", tmp.display()))?;
-
-    // Atomic rename
     fs::rename(&tmp, &target).with_context(|| {
         format!(
             "Failed to atomically rename: {} -> {}",
@@ -170,7 +195,35 @@ pub fn save_state(state_dir: &Path, state: &DaemonStateFile) -> Result<()> {
         )
     })?;
 
+    // Best-effort: a fsync_dir failure doesn't roll back the rename, and
+    // propagating it as Err would cause the memory-vs-disk drift described
+    // in the docstring above.
+    if let Err(e) = fsync_dir(dir) {
+        tracing::warn!(
+            "atomic_write: rename of {} succeeded but parent dir fsync failed: {:#} \
+             (data is in the right place; durability across a crash is best-effort on this fs)",
+            target.display(),
+            e
+        );
+    }
     Ok(())
+}
+
+/// fsync a directory so a `rename` / `unlink` inside it is durable across a
+/// crash. Surfaces the error so the caller can decide (best-effort).
+pub fn fsync_dir(dir: &Path) -> Result<()> {
+    let f = fs::File::open(dir)
+        .with_context(|| format!("Failed to open directory {} for fsync", dir.display()))?;
+    f.sync_all()
+        .with_context(|| format!("Failed to sync_all on directory {}", dir.display()))?;
+    Ok(())
+}
+
+/// Atomically write to state.json (write-tmp + fsync + rename + parent fsync).
+pub fn save_state(state_dir: &Path, state: &DaemonStateFile) -> Result<()> {
+    let content =
+        serde_json::to_string_pretty(state).context("Failed to serialize DaemonStateFile")?;
+    atomic_write(state_dir, STATE_FILE, content.as_bytes(), None)
 }
 
 #[cfg(test)]
@@ -272,5 +325,29 @@ mod tests {
         // Should not exist .tmp file after successful write
         let tmp_path = dir.path().join(format!("{}.tmp", STATE_FILE));
         assert!(!tmp_path.exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn atomic_write_chmods_over_stale_tmp() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let name = "policy.toml";
+        // Simulate a prior crashed write: stale .tmp on disk with 0o644.
+        let stale_tmp = dir.path().join(format!("{}.tmp", name));
+        fs::write(&stale_tmp, b"old garbage").unwrap();
+        fs::set_permissions(&stale_tmp, fs::Permissions::from_mode(0o644)).unwrap();
+
+        atomic_write(dir.path(), name, b"new content", Some(0o600)).unwrap();
+
+        let final_mode = fs::metadata(dir.path().join(name))
+            .unwrap()
+            .permissions()
+            .mode()
+            & 0o777;
+        assert_eq!(
+            final_mode, 0o600,
+            "stale-tmp inode reuse must not leak 0o644"
+        );
     }
 }
