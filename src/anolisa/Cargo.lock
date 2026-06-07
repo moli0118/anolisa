@@ -46,6 +46,7 @@ dependencies = [
  "tempfile",
  "thiserror",
  "toml",
+ "unicode-width",
 ]
 
 [[package]]
@@ -54,6 +55,7 @@ version = "0.1.0"
 dependencies = [
  "anolisa-env",
  "anolisa-platform",
+ "base64",
  "chrono",
  "flate2",
  "fs2",

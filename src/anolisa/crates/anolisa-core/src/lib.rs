@@ -30,6 +30,7 @@ pub mod service;
 pub mod state;
 pub mod subscription;
 pub mod transaction;
+pub mod upload;
 
 pub use backup::{BackupEntry, BackupSet};
 pub use capability::{CapabilityError, CapabilityResolver, ResolvedPlan};
@@ -84,7 +85,12 @@ pub use state::{
     InstalledState, ObjectKind, ObjectStatus, OperationRecord, OwnedFile, STATE_SCHEMA_VERSION,
     ServiceRef, StateError, SubscriptionScope,
 };
+pub use subscription::{
+    ConsentState, LATER_EXPIRE_SECS, ProductType, RegisterRecord, RegisterSource, RegisterState,
+    RegistrationManager, SubscriptionError, current_operator, require_root,
+};
 pub use transaction::{
     JOURNAL_SCHEMA_VERSION, RollbackAction, RollbackActionKind, Transaction, TransactionError,
     TransactionOutcome, TransactionOutcomeStatus, TransactionStep, TransactionStepStatus,
 };
+pub use upload::{UploadConfig, UploadError, UploadStarter, validate_sls_account_id};
