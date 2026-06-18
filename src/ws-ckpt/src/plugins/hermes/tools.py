@@ -320,9 +320,10 @@ WS_CKPT_LIST_SCHEMA: Dict[str, Any] = {
 WS_CKPT_DIFF_SCHEMA: Dict[str, Any] = {
     "name": "ws-ckpt-diff",
     "description": (
-        "Compare file changes between two snapshots. Always display the "
-        "FULL untruncated result to the user. Do NOT re-interpret or "
-        "contradict the tool output."
+        "Compare file changes between two snapshots, or between a snapshot "
+        "and the current workspace state. Omit 'to' to diff against the "
+        "current workspace. Always display the FULL untruncated result to "
+        "the user. Do NOT re-interpret or contradict the tool output."
     ),
     "parameters": {
         "type": "object",
@@ -334,11 +335,11 @@ WS_CKPT_DIFF_SCHEMA: Dict[str, Any] = {
             "to": {
                 "type": "string",
                 "description": (
-                    "Target snapshot id or name (defaults to current state)"
+                    "Target snapshot id or name. Omit to diff against current workspace state."
                 ),
             },
         },
-        "required": ["from", "to"],
+        "required": ["from"],
         "additionalProperties": False,
     },
 }
@@ -697,13 +698,13 @@ def handle_ws_ckpt_diff(args: Dict[str, Any], **_kwargs) -> str:
     to_id = (args.get("to") or "").strip()
     if not from_id:
         return _err("'from' is required")
-    if not to_id:
-        return _err("'to' is required")
 
     workspace, ws_err = _require_workspace()
     if ws_err:
         return ws_err
-    cmd = ["ws-ckpt", "diff", "-w", workspace, "--from", from_id, "--to", to_id]
+    cmd = ["ws-ckpt", "diff", "-w", workspace, "--from", from_id]
+    if to_id:
+        cmd.extend(["--to", to_id])
     success, output = _run_ws_ckpt_cmd(cmd)
     return _ok(output) if success else _err(output)
 

@@ -1217,7 +1217,7 @@ mod tests {
             &self,
             _: &str,
             _: &str,
-            _: &str,
+            _: Option<&str>,
         ) -> anyhow::Result<Vec<ws_ckpt_common::DiffEntry>> {
             unimplemented!()
         }

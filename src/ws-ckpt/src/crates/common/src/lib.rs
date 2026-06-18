@@ -83,7 +83,7 @@ pub enum Request {
     Diff {
         workspace: String,
         from: String,
-        to: String,
+        to: Option<String>,
     },
     Status {
         workspace: Option<String>,
@@ -1843,7 +1843,7 @@ mod tests {
         let req = Request::Diff {
             workspace: "/tmp/ws".to_string(),
             from: "msg1-step0".to_string(),
-            to: "msg2-step0".to_string(),
+            to: Some("msg2-step0".to_string()),
         };
         let decoded = round_trip_request(&req);
         match decoded {
@@ -1854,7 +1854,7 @@ mod tests {
             } => {
                 assert_eq!(workspace, "/tmp/ws");
                 assert_eq!(from, "msg1-step0");
-                assert_eq!(to, "msg2-step0");
+                assert_eq!(to, Some("msg2-step0".to_string()));
             }
             _ => panic!("expected Diff variant"),
         }

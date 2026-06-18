@@ -371,11 +371,21 @@ impl StorageBackend for BtrfsBaseBackend {
         Ok(())
     }
 
-    async fn diff(&self, ws_id: &str, from: &str, to: &str) -> anyhow::Result<Vec<DiffEntry>> {
+    async fn diff(
+        &self,
+        ws_id: &str,
+        from: &str,
+        to: Option<&str>,
+    ) -> anyhow::Result<Vec<DiffEntry>> {
         let snap_base = self.snapshots_dir.join(ws_id);
         let snap_from = snap_base.join(from);
-        let snap_to = snap_base.join(to);
-        btrfs_common::diff_between_snapshots(&snap_from, &snap_to).await
+        match to {
+            Some(id) => btrfs_common::diff_between_snapshots(&snap_from, &snap_base.join(id)).await,
+            None => {
+                let live = self.data_root.join(ws_id);
+                btrfs_common::diff_against_live(&snap_from, &live, &snap_base).await
+            }
+        }
     }
 
     async fn cleanup_snapshots(

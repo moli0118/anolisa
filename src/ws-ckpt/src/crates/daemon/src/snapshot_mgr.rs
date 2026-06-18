@@ -421,7 +421,7 @@ pub async fn diff_snapshots(
     state: &Arc<DaemonState>,
     workspace: &str,
     from: &str,
-    to: &str,
+    to: Option<&str>,
 ) -> anyhow::Result<Response> {
     let arc = match state.resolve_workspace(workspace).await {
         Some(a) => a,
@@ -434,12 +434,21 @@ pub async fn diff_snapshots(
         Ok(id) => id,
         Err(e) => return Ok(snapshot_resolve_error_response(from, e)),
     };
-    let to_id = match resolve_snapshot_id(&ws.index, to) {
-        Ok(id) => id,
-        Err(e) => return Ok(snapshot_resolve_error_response(to, e)),
+    let to_id = match to {
+        Some(t) => {
+            let id = match resolve_snapshot_id(&ws.index, t) {
+                Ok(id) => id,
+                Err(e) => return Ok(snapshot_resolve_error_response(t, e)),
+            };
+            Some(id)
+        }
+        None => None,
     };
 
-    let changes = state.backend.diff(&ws.ws_id, &from_id, &to_id).await?;
+    let changes = state
+        .backend
+        .diff(&ws.ws_id, &from_id, to_id.as_deref())
+        .await?;
 
     Ok(Response::DiffOk { changes })
 }
@@ -1040,7 +1049,7 @@ mod tests {
             .insert("real-id".to_string(), make_snapshot_meta(false));
         state.register_workspace("ws-diff".to_string(), PathBuf::from("/home/user/ws"), index);
 
-        let resp = diff_snapshots(&state, "ws-diff", "does-not-exist", "real-id")
+        let resp = diff_snapshots(&state, "ws-diff", "does-not-exist", Some("real-id"))
             .await
             .unwrap();
         match resp {
@@ -1052,7 +1061,7 @@ mod tests {
         }
 
         // Also covers the `to`-side branch.
-        let resp = diff_snapshots(&state, "ws-diff", "real-id", "missing-to")
+        let resp = diff_snapshots(&state, "ws-diff", "real-id", Some("missing-to"))
             .await
             .unwrap();
         match resp {
@@ -1061,6 +1070,108 @@ mod tests {
                 assert!(message.contains("missing-to"), "got: {}", message);
             }
             other => panic!("expected SnapshotNotFound, got: {:?}", other),
+        }
+    }
+
+    #[tokio::test]
+    async fn diff_snapshots_to_none_skips_resolution_and_reaches_backend() {
+        use ws_ckpt_common::DiffEntry;
+
+        struct DiffStubBackend;
+
+        #[async_trait::async_trait]
+        impl StorageBackend for DiffStubBackend {
+            fn backend_type(&self) -> ws_ckpt_common::backend::BackendType {
+                ws_ckpt_common::backend::BackendType::BtrfsBase
+            }
+            fn data_root(&self) -> &std::path::Path {
+                std::path::Path::new("/tmp/stub")
+            }
+            fn snapshots_root(&self) -> &std::path::Path {
+                std::path::Path::new("/tmp/stub-snaps")
+            }
+            async fn diff(
+                &self,
+                _ws_id: &str,
+                _from: &str,
+                to: Option<&str>,
+            ) -> anyhow::Result<Vec<DiffEntry>> {
+                assert!(to.is_none(), "expected to=None, got {:?}", to);
+                Ok(vec![DiffEntry {
+                    path: "live-change.txt".into(),
+                    change_type: ws_ckpt_common::ChangeType::Added,
+                    detail: None,
+                }])
+            }
+            async fn init_workspace(
+                &self,
+                _: &str,
+                _: &str,
+            ) -> anyhow::Result<ws_ckpt_common::WorkspaceInfo> {
+                unimplemented!()
+            }
+            async fn create_snapshot(&self, _: &str, _: &str) -> anyhow::Result<()> {
+                unimplemented!()
+            }
+            async fn rollback(&self, _: &str, _: &str) -> anyhow::Result<PathBuf> {
+                unimplemented!()
+            }
+            async fn delete_snapshot(&self, _: &str, _: &str) -> anyhow::Result<()> {
+                unimplemented!()
+            }
+            async fn recover_workspace(&self, _: &str, _: &str) -> anyhow::Result<()> {
+                unimplemented!()
+            }
+            async fn cleanup_snapshots(
+                &self,
+                _: &str,
+                _: &[String],
+            ) -> anyhow::Result<Vec<String>> {
+                unimplemented!()
+            }
+            async fn fork(&self, _: &str, _: &str, _: &str) -> anyhow::Result<()> {
+                unimplemented!()
+            }
+            async fn gc_generations(
+                &self,
+                _: &str,
+            ) -> anyhow::Result<ws_ckpt_common::backend::GcResult> {
+                unimplemented!()
+            }
+            async fn check_environment(
+                &self,
+            ) -> anyhow::Result<ws_ckpt_common::backend::EnvironmentStatus> {
+                unimplemented!()
+            }
+            async fn get_usage(&self) -> anyhow::Result<(u64, u64)> {
+                unimplemented!()
+            }
+        }
+
+        let state = Arc::new(crate::state::DaemonState::new(
+            test_config(),
+            Arc::new(DiffStubBackend),
+            test_state_dir(),
+        ));
+        let mut index = SnapshotIndex::new(PathBuf::from("/home/user/ws"));
+        index
+            .snapshots
+            .insert("snap-from".to_string(), make_snapshot_meta(false));
+        state.register_workspace(
+            "ws-diff-live".to_string(),
+            PathBuf::from("/home/user/ws"),
+            index,
+        );
+
+        let resp = diff_snapshots(&state, "ws-diff-live", "snap-from", None)
+            .await
+            .unwrap();
+        match resp {
+            Response::DiffOk { changes } => {
+                assert_eq!(changes.len(), 1);
+                assert_eq!(changes[0].path, "live-change.txt");
+            }
+            other => panic!("expected DiffOk, got: {:?}", other),
         }
     }
 
@@ -1140,7 +1251,7 @@ mod tests {
             &self,
             _: &str,
             _: &str,
-            _: &str,
+            _: Option<&str>,
         ) -> anyhow::Result<Vec<ws_ckpt_common::DiffEntry>> {
             unimplemented!()
         }

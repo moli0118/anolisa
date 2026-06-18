@@ -228,7 +228,7 @@ export async function handleDiff(
       isError: true,
     };
   }
-  const result = await pluginState.manager.execDiffRaw(fromArg, toArg ?? "HEAD");
+  const result = await pluginState.manager.execDiffRaw(fromArg, toArg);
   return { text: result.text, isError: !result.success };
 }
 

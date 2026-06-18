@@ -81,12 +81,12 @@ pub trait StorageBackend: Send + Sync {
     /// - btrfs-loop: rsync restore + remove symlink + delete subvolume + umount + losetup -d + remove img
     async fn recover_workspace(&self, ws_id: &str, original_path: &str) -> anyhow::Result<()>;
 
-    /// Compute the diff between two snapshots
+    /// Compute diff between two snapshots, or between a snapshot and the live workspace.
     async fn diff(
         &self,
         ws_id: &str,
         from: &str,
-        to: &str,
+        to: Option<&str>,
     ) -> anyhow::Result<Vec<crate::DiffEntry>>;
 
     /// Clean up old snapshots (retain the most recent `keep` + all pinned ones)

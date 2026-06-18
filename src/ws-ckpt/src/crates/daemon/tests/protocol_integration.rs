@@ -421,7 +421,7 @@ async fn full_diff_request_response_over_socket() {
     let request = Request::Diff {
         workspace: "/tmp/ws".to_string(),
         from: "msg1-step0".to_string(),
-        to: "msg2-step0".to_string(),
+        to: Some("msg2-step0".to_string()),
     };
     let frame = encode_frame(&request).unwrap();
     client.write_all(&frame).await.unwrap();

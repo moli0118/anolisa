@@ -159,21 +159,20 @@ export class CommandExecutor {
   }
 
   /**
-   * Show the diff between two snapshots.
+   * Show the diff between two snapshots, or between a snapshot and the current workspace.
    *
-   * Equivalent to: `ws-ckpt diff --workspace <ws> --from <a> --to <b>`
+   * Equivalent to: `ws-ckpt diff --workspace <ws> --from <a> [--to <b>]`
    *
    * @param workspace - Workspace directory path.
    * @param from      - Source snapshot identifier or name.
-   * @param to        - Target snapshot identifier or name.
+   * @param to        - Target snapshot identifier or name. Omit to diff against current workspace.
    */
-  public async diff(workspace: string, from: string, to: string): Promise<CommandOutput> {
-    return this.run([
-      "diff",
-      "--workspace", workspace,
-      "--from", from,
-      "--to", to,
-    ]);
+  public async diff(workspace: string, from: string, to?: string): Promise<CommandOutput> {
+    const args = ["diff", "--workspace", workspace, "--from", from];
+    if (to) {
+      args.push("--to", to);
+    }
+    return this.run(args);
   }
 
   /**

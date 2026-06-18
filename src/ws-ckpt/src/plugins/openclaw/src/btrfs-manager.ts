@@ -292,7 +292,7 @@ export class BtrfsManager {
   /**
    * Execute diff and return the raw CLI output without parsing.
    */
-  public async execDiffRaw(from: string, to: string): Promise<{ success: boolean; text: string }> {
+  public async execDiffRaw(from: string, to?: string): Promise<{ success: boolean; text: string }> {
     if (!this.workspacePath) {
       return { success: false, text: "Workspace not initialized" };
     }
@@ -302,7 +302,8 @@ export class BtrfsManager {
         return { success: false, text: mapErrorToLLMMessage(output.stderr) };
       }
       const stdout = output.stdout.replace(/\x1b\[[0-9;]*m/g, '').trim();
-      return { success: true, text: stdout || `No changes between ${from} and ${to}.` };
+      const target = to ?? "current workspace";
+      return { success: true, text: stdout || `No changes between ${from} and ${target}.` };
     } catch (error) {
       const msg = error instanceof Error ? error.message : String(error);
       return { success: false, text: `Diff error: ${msg}` };

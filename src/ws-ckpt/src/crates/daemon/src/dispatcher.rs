@@ -106,7 +106,9 @@ pub async fn dispatch(state: &Arc<DaemonState>, request: Request) -> Response {
             to,
         } => match state.ensure_bootstrapped().await {
             Err(e) => Err(e),
-            Ok(()) => crate::snapshot_mgr::diff_snapshots(state, &workspace, &from, &to).await,
+            Ok(()) => {
+                crate::snapshot_mgr::diff_snapshots(state, &workspace, &from, to.as_deref()).await
+            }
         },
         Request::Status { workspace } => {
             // Inline status query logic
@@ -900,7 +902,7 @@ mod tests {
         let req = Request::Diff {
             workspace: "/nonexistent/path/12345".to_string(),
             from: "msg1-step0".to_string(),
-            to: "msg2-step0".to_string(),
+            to: Some("msg2-step0".to_string()),
         };
         let resp = dispatch(&state, req).await;
         match resp {

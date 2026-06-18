@@ -185,7 +185,7 @@ enum Commands {
         format: String,
     },
 
-    /// Show diff between two snapshots
+    /// Show diff between two snapshots, or between a snapshot and the current workspace
     Diff {
         /// Workspace path or ID (absolute path, relative path, or workspace ID)
         #[arg(long, short = 'w', value_parser = workspace_value_parser())]
@@ -195,9 +195,9 @@ enum Commands {
         #[arg(long, short = 'f', value_parser = snapshot_id_value_parser())]
         from: String,
 
-        /// Target snapshot (ID or name)
+        /// Target snapshot (ID or name); omit to diff against current workspace
         #[arg(long, short = 't', value_parser = snapshot_id_value_parser())]
-        to: String,
+        to: Option<String>,
     },
 
     /// Show daemon and workspace status
@@ -390,6 +390,7 @@ async fn run(cli: Cli) -> Result<()> {
                 from,
                 to,
             };
+
             let response = send_request_to_daemon(&request).await?;
             handle_diff_response(response)?;
         }
@@ -2287,7 +2288,7 @@ mod tests {
             } => {
                 assert_eq!(workspace, "/tmp/test");
                 assert_eq!(from, "msg1-step0");
-                assert_eq!(to, "msg2-step0");
+                assert_eq!(to, Some("msg2-step0".to_string()));
             }
             _ => panic!("expected Diff"),
         }

@@ -132,19 +132,23 @@ ws-ckpt delete -w ./my-project -s test --force
 ### 2.5 查看快照间差异
 
 ```bash
-ws-ckpt diff -w <workspace> -f <snapshot> -t <snapshot>
+ws-ckpt diff -w <workspace> -f <snapshot> [-t <snapshot>]
 ```
 
 | 参数            | 简写   | 必填 | 说明            |
 | --------------- | ------ | ---- | --------------- |
 | `--workspace` | `-w` | 是   | 工作区路径或 ID |
 | `--from`      | `-f` | 是   | 起始快照 ID     |
-| `--to`        | `-t` | 是   | 目标快照 ID     |
+| `--to`        | `-t` | 否   | 目标快照 ID；省略时与当前工作区比较 |
 
 **示例**：
 
 ```bash
+# 比较两个快照
 ws-ckpt diff -w ./my-project -f msg1-step0 -t test
+
+# 与当前工作区比较
+ws-ckpt diff -w ./my-project -f msg1-step0
 ```
 
 **输出标记说明**：

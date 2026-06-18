@@ -178,8 +178,9 @@ export function registerTools(api: OpenClawPluginApi): void {
     {
       name: "ws-ckpt-diff",
       description:
-        "Compare file changes between two snapshots. " +
-        "Always display the FULL untruncated diff. " +
+        "Compare file changes between two snapshots, or between a snapshot " +
+        "and the current workspace state. Omit 'to' to diff against the " +
+        "current workspace. Always display the FULL untruncated diff. " +
         "Do NOT re-interpret or contradict the tool output.",
       parameters: {
         type: "object",
@@ -191,10 +192,10 @@ export function registerTools(api: OpenClawPluginApi): void {
           to: {
             type: "string",
             description:
-              "Target snapshot id or name (defaults to current state)",
+              "Target snapshot id or name. Omit to diff against current workspace state.",
           },
         },
-        required: ["from", "to"],
+        required: ["from"],
       },
       async execute(_toolCallId, params) {
         const r = await handleDiff(
