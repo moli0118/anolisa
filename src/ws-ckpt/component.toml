@@ -1,0 +1,11 @@
+[component]
+name = "ws-ckpt"
+version = "0.3.3"
+
+[[adapters]]
+framework = "openclaw"
+plugin_id = "ws-ckpt"
+
+[[adapters]]
+framework = "hermes"
+plugin_id = "ws-ckpt"

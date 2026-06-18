@@ -67,6 +67,7 @@ find %{buildroot}%{_datadir}/anolisa/runtime/ws-ckpt/plugins/hermes \
        -o -type f -name '*.pyc' -o -type f -name '.coverage' \) \
     -exec rm -rf {} +
 install -p -m 0644 adapter-manifest.json %{buildroot}%{_datadir}/anolisa/adapters/ws-ckpt/manifest.json
+install -p -m 0644 component.toml %{buildroot}%{_datadir}/anolisa/adapters/ws-ckpt/component.toml
 install -p -m 0644 scripts/lib-discover.sh %{buildroot}%{_datadir}/anolisa/adapters/ws-ckpt/scripts/
 install -p -m 0755 scripts/detect-openclaw.sh %{buildroot}%{_datadir}/anolisa/adapters/ws-ckpt/scripts/
 install -p -m 0755 scripts/install-openclaw.sh %{buildroot}%{_datadir}/anolisa/adapters/ws-ckpt/scripts/

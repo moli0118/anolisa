@@ -43,6 +43,7 @@ else
 	cp -pr src/skills/ws-ckpt/. "$(DESTDIR)$(COSH_SKILLS_DIR)"
 	install -d -m 0755 "$(DESTDIR)$(ADAPTER_DIR)"
 	install -p -m 0644 adapter-manifest.json "$(DESTDIR)$(ADAPTER_DIR)/manifest.json"
+	install -p -m 0644 component.toml "$(DESTDIR)$(ADAPTER_DIR)/component.toml"
 	install -d -m 0755 "$(DESTDIR)$(ADAPTER_DIR)/scripts"
 	install -p -m 0644 scripts/lib-discover.sh "$(DESTDIR)$(ADAPTER_DIR)/scripts/"
 	install -p -m 0755 scripts/detect-openclaw.sh "$(DESTDIR)$(ADAPTER_DIR)/scripts/"
