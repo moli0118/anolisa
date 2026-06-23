@@ -47,6 +47,15 @@ cleanup() {
     rm -rf "$TMPBASE"
     echo "Cleaned up $TMPBASE"
 }
+
+# Back up existing state_dir before cleanup can run, so early failures cannot
+# remove real ws-ckpt state.
+if [ -d "$STATE_DIR" ]; then
+    STATE_DIR_BACKUP="$(mktemp -d /tmp/ws-ckpt-state-backup.XXXXXX)"
+    mv "$STATE_DIR" "$STATE_DIR_BACKUP/state"
+    STATE_DIR_BACKUP="$STATE_DIR_BACKUP/state"
+    echo "Backed up existing $STATE_DIR to $STATE_DIR_BACKUP"
+fi
 trap cleanup EXIT
 
 assert_ok() {
@@ -109,14 +118,6 @@ if [ -S "/run/ws-ckpt/ws-ckpt.sock" ]; then
     echo "FATAL: a ws-ckpt daemon is already running (socket exists at /run/ws-ckpt/ws-ckpt.sock)."
     echo "Stop it first: systemctl stop ws-ckpt"
     exit 1
-fi
-
-# Back up existing state_dir if present (e.g. from a real installation)
-if [ -d "$STATE_DIR" ]; then
-    STATE_DIR_BACKUP="$(mktemp -d /tmp/ws-ckpt-state-backup.XXXXXX)"
-    mv "$STATE_DIR" "$STATE_DIR_BACKUP/state"
-    STATE_DIR_BACKUP="$STATE_DIR_BACKUP/state"
-    echo "Backed up existing $STATE_DIR to $STATE_DIR_BACKUP"
 fi
 
 # ── start daemon ──────────────────────────────────────────────────────────────
