@@ -131,8 +131,8 @@ enum Commands {
         #[arg(long, short = 'w', value_parser = workspace_value_parser())]
         workspace: String,
 
-        /// Snapshot ID (must be unique within the workspace)
-        #[arg(long = "snapshot", short = 's', required_unless_present = "legacy_id", conflicts_with = "legacy_id", value_parser = snapshot_id_value_parser())]
+        /// Snapshot ID (auto-generated if omitted)
+        #[arg(long = "snapshot", short = 's', conflicts_with = "legacy_id", value_parser = snapshot_id_value_parser())]
         snapshot: Option<String>,
 
         #[arg(long = "id", short = 'i', hide = true, value_parser = snapshot_id_value_parser())]
@@ -332,11 +332,13 @@ async fn run(cli: Cli) -> Result<()> {
             message,
             metadata,
         } => {
-            let id = if let Some(legacy) = legacy_id {
-                eprintln!("Warning: --id/-i is deprecated, use --snapshot/-s instead");
-                legacy
-            } else {
-                snapshot.expect("clap should require either snapshot or legacy_id")
+            let id = match (snapshot, legacy_id) {
+                (_, Some(legacy)) => {
+                    eprintln!("Warning: --id/-i is deprecated, use --snapshot/-s instead");
+                    legacy
+                }
+                (Some(s), _) => s,
+                (None, None) => generate_auto_id(),
             };
             // Validate metadata is valid JSON if provided
             if let Some(ref s) = metadata {
@@ -467,6 +469,12 @@ fn snapshot_id_value_parser() -> impl TypedValueParser<Value = String> {
         }
         Ok(s)
     })
+}
+
+fn generate_auto_id() -> String {
+    chrono::Utc::now()
+        .format("ckpt-%Y%m%dT%H%M%S%.3f")
+        .to_string()
 }
 
 /// Resolve workspace identifier: convert filesystem paths to absolute,
@@ -2237,9 +2245,41 @@ mod tests {
     }
 
     #[test]
-    fn checkpoint_missing_snapshot_fails() {
-        let result = Cli::try_parse_from(["ws-ckpt", "checkpoint", "--workspace", "/ws"]);
-        assert!(result.is_err(), "checkpoint without --snapshot should fail");
+    fn checkpoint_missing_snapshot_parses_as_none() {
+        let cli = Cli::try_parse_from(["ws-ckpt", "checkpoint", "--workspace", "/ws"]).unwrap();
+        match cli.command {
+            Commands::Checkpoint {
+                snapshot,
+                legacy_id,
+                ..
+            } => {
+                assert!(snapshot.is_none());
+                assert!(legacy_id.is_none());
+            }
+            _ => panic!("expected Checkpoint"),
+        }
+    }
+
+    #[test]
+    fn generate_auto_id_matches_expected_format() {
+        let id = generate_auto_id();
+        assert!(
+            id.starts_with("ckpt-"),
+            "auto id should start with ckpt- prefix"
+        );
+        assert_eq!(
+            id.len(),
+            "ckpt-YYYYMMDDTHHmmss.fff".len(),
+            "auto id {:?} has unexpected length",
+            id
+        );
+        let body = &id[5..];
+        assert!(
+            body.chars()
+                .all(|c| c.is_ascii_digit() || c == 'T' || c == '.'),
+            "auto id body {:?} contains unexpected characters",
+            body
+        );
     }
 
     #[test]
