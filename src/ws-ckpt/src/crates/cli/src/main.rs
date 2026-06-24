@@ -17,9 +17,25 @@ use ws_ckpt_common::{
     GLOBAL_CONFIG_JSON_SCHEMA, MAX_FRAME_SIZE, OVERVIEW_JSON_SCHEMA,
 };
 
+use std::cell::RefCell;
+
 /// Backend-usage advisory threshold (percent); CLI-side since daemon returns raw bytes.
 const ADVISORY_FS_USAGE_PCT: f64 = 90.0;
 const ADVISORY_TIMEOUT: std::time::Duration = std::time::Duration::from_millis(30);
+
+// JSON output buffer: handlers stage their payload here so main() can wrap
+// it with `elapsed_secs` and emit a single JSON object on stdout.
+thread_local! {
+    static JSON_OUTPUT: RefCell<Option<serde_json::Value>> = const { RefCell::new(None) };
+}
+
+fn emit_json(value: serde_json::Value) {
+    JSON_OUTPUT.with(|buf| *buf.borrow_mut() = Some(value));
+}
+
+fn take_json_output() -> Option<serde_json::Value> {
+    JSON_OUTPUT.with(|buf| buf.borrow_mut().take())
+}
 
 // Parse CLI value for `--auto-cleanup-keep`: integer -> Count mode, duration
 // string (e.g. "30d", units s/m/h/d/w) -> Age mode. Mirrors TOML semantics in
@@ -256,14 +272,41 @@ enum Commands {
 #[tokio::main]
 async fn main() {
     let cli = Cli::parse();
+    let is_daemon = matches!(cli.command, Commands::Daemon { .. });
+    let start = std::time::Instant::now();
 
     match run(cli).await {
         Ok(()) => {
+            if !is_daemon {
+                let elapsed = start.elapsed().as_secs_f64();
+                // JSON mode: inject timing into buffered output; text mode: stderr.
+                if let Some(mut data) = take_json_output() {
+                    if let serde_json::Value::Object(map) = &mut data {
+                        map.insert("elapsed_secs".to_string(), serde_json::json!(elapsed));
+                    }
+                    println!("{}", serde_json::to_string_pretty(&data).unwrap());
+                } else {
+                    println!("Completed in {:.3}s", elapsed);
+                }
+            }
             // Post-command soft advisory: best-effort, silent on failure.
             print_health_advisory_if_needed().await;
         }
         Err(e) => {
-            eprintln!("\x1b[31mError: {:#}\x1b[0m", e);
+            let elapsed = start.elapsed().as_secs_f64();
+            if let Some(mut data) = take_json_output() {
+                if let serde_json::Value::Object(map) = &mut data {
+                    map.insert("elapsed_secs".to_string(), serde_json::json!(elapsed));
+                    map.insert("error".to_string(), serde_json::json!(format!("{:#}", e)));
+                }
+                // Errors go to stderr so stdout stays clean for pipes.
+                eprintln!("{}", serde_json::to_string_pretty(&data).unwrap());
+            } else if !is_daemon {
+                eprintln!("Failed after {:.3}s", elapsed);
+            }
+            if !is_daemon {
+                eprintln!("\x1b[31mError: {:#}\x1b[0m", e);
+            }
             process::exit(1);
         }
     }
@@ -811,7 +854,7 @@ fn handle_list_response(response: Response, format: &str) -> Result<()> {
     match response {
         Response::ListOk { snapshots } => {
             if format == "json" {
-                println!("{}", serde_json::to_string_pretty(&snapshots)?);
+                emit_json(serde_json::to_value(&snapshots)?);
             } else {
                 // Table format
                 if snapshots.is_empty() {
@@ -931,7 +974,7 @@ fn handle_status_response(response: Response, format: &str) -> Result<()> {
     match response {
         Response::StatusOk { report } => {
             if format == "json" {
-                println!("{}", serde_json::to_string_pretty(&report)?);
+                emit_json(serde_json::to_value(&report)?);
             } else {
                 println!("\x1b[1mDaemon Status\x1b[0m");
                 println!("  Uptime: {} seconds", report.uptime_secs);
@@ -1252,7 +1295,7 @@ fn print_workspace_policy_response_formatted(resp: Response, format: OutputForma
             }
             OutputFormat::Json => {
                 let json = WorkspacePolicyJson::from_views(ws_id, &effective, &local, &global);
-                println!("{}", serde_json::to_string_pretty(&json)?);
+                emit_json(serde_json::to_value(&json)?);
                 Ok(())
             }
         },
@@ -1304,7 +1347,7 @@ async fn handle_global_config_view(format: OutputFormat) -> Result<()> {
             img_size_gb: img_size,
             img_max_percent: img_max,
         };
-        println!("{}", serde_json::to_string_pretty(&json)?);
+        emit_json(serde_json::to_value(&json)?);
         return Ok(());
     }
 
@@ -1408,7 +1451,7 @@ async fn handle_config_overview_view(format: OutputFormat) -> Result<()> {
                 "inherit_global": inherit,
             },
         });
-        println!("{}", serde_json::to_string_pretty(&json)?);
+        emit_json(json);
         return Ok(());
     }
 
@@ -1547,7 +1590,7 @@ async fn handle_global_config_update(
         match reloaded_config {
             Some(cr) => {
                 let json = config_report_to_global_json(&cr);
-                println!("{}", serde_json::to_string_pretty(&json)?);
+                emit_json(serde_json::to_value(&json)?);
             }
             None => handle_global_config_view(format).await?,
         }

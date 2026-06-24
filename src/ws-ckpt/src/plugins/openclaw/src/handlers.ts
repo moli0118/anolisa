@@ -5,7 +5,7 @@
  * They access shared state via the pluginState singleton.
  */
 
-import { CommandExecutor } from "./commands.js";
+import { CommandExecutor, extractTiming } from "./commands.js";
 import { mapErrorToLLMMessage } from "./btrfs-manager.js";
 import type { AgentToolResult } from "../types-shim.js";
 import { pluginState, UNAVAILABLE_MSG, cwdInsideWorkspace, cwdInsideWorkspaceReason } from "./state.js";
@@ -59,10 +59,11 @@ export async function handleCheckpoint(
       if (output.exitCode !== 0) {
         return { text: mapErrorToLLMMessage(output.stderr, { id }), isError: true };
       }
+      const timing = extractTiming(output.stdout);
       if (output.stdout && (output.stdout.includes('Skipped') || output.stdout.includes('Empty workspace'))) {
-        return { text: 'Empty workspace, no snapshot created.', isError: false };
+        return { text: `Empty workspace, no snapshot created.${timing}`, isError: false };
       }
-      return { text: `Checkpoint created: ${id}`, isError: false };
+      return { text: `Checkpoint created: ${id}${timing}`, isError: false };
     } catch (error) {
       const msg = error instanceof Error ? error.message : String(error);
       return { text: `Checkpoint error: ${msg}`, isError: true };
@@ -140,8 +141,9 @@ async function runRollbackViaExecutor(
       const label = target || `ancestors=${numAncestors}`;
       return { text: mapErrorToLLMMessage(output.stderr, { id: label }), isError: true };
     }
+    const timing = extractTiming(output.stdout);
     const desc = target ? `Rolled back to ${target}` : `Rolled back ${numAncestors} ancestor(s)`;
-    return { text: desc, isError: false };
+    return { text: `${desc}${timing}`, isError: false };
   } catch (error) {
     const msg = error instanceof Error ? error.message : String(error);
     return { text: `Rollback error: ${msg}`, isError: true };
@@ -208,7 +210,7 @@ export async function handleDelete(
       return { text: mapErrorToLLMMessage(output.stderr, { id: snapshot }), isError: true };
     }
     pluginState.manager.getStore().remove(snapshot);
-    return { text: `Snapshot ${snapshot} deleted`, isError: false };
+    return { text: `Snapshot ${snapshot} deleted${extractTiming(output.stdout)}`, isError: false };
   } catch (error) {
     const msg = error instanceof Error ? error.message : String(error);
     return { text: `Delete error: ${msg}`, isError: true };

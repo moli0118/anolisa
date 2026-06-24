@@ -293,6 +293,11 @@ export class CommandExecutor {
 
 }
 
+export function extractTiming(stdout: string): string {
+  const match = stdout.match(/^(Completed in .+|Failed after .+)$/m);
+  return match ? ` (${match[1]})` : "";
+}
+
 /**
  * Execute a crontab command. Returns structured output, never throws.
  * When input is provided, writes to a temp file and runs `crontab <file>`

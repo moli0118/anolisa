@@ -6,7 +6,7 @@
  * {@link CommandExecutor} and maintaining a local {@link SnapshotStore} cache.
  */
 
-import { CommandExecutor } from "./commands.js";
+import { CommandExecutor, extractTiming } from "./commands.js";
 import { SnapshotStore } from "./snapshot-store.js";
 import type {
   CheckpointResult,
@@ -207,7 +207,7 @@ export class BtrfsManager {
       return {
         success: true,
         snapshot: snapshotId,
-        message: `Checkpoint created: ${snapshotId}`,
+        message: `Checkpoint created: ${snapshotId}${extractTiming(output.stdout)}`,
       };
     } catch (error) {
       const msg = error instanceof Error ? error.message : String(error);
@@ -249,7 +249,7 @@ export class BtrfsManager {
       } catch { /* ignore refresh errors */ }
 
       const desc = target ? `Rolled back to ${target}` : `Rolled back ${numAncestors} ancestor(s)`;
-      return { success: true, target, message: desc };
+      return { success: true, target, message: `${desc}${extractTiming(output.stdout)}` };
     } catch (error) {
       const msg = error instanceof Error ? error.message : String(error);
       return { success: false, target, message: `Rollback error: ${msg}` };
