@@ -5,9 +5,9 @@ description: Install and configure OpenClaw non-interactively with Alibaba Cloud
 
 # OpenClaw Non-Interactive Setup
 
-Use this skill to turn a user's one-sentence request into a complete local OpenClaw setup. The normal path is one script command: install Node.js/npm/OpenClaw when needed, write Alibaba Cloud Model Studio config, install/restart the local gateway service, and verify `openclaw gateway health`.
+Use this skill to turn a user's one-sentence request into a complete local OpenClaw setup. The normal path is one script command: resolve the Alibaba Cloud Model Studio plan, validate the API key/Base URL/model combination with the official `anthropic-messages` endpoint shape, install Node.js/npm/OpenClaw when needed, write config, install/restart the local gateway service, and verify `openclaw gateway health`.
 
-Do not use `openclaw onboard` unless the user explicitly asks for interactive setup. Do not configure DingTalk unless the user provides DingTalk credentials or asks for DingTalk access.
+Do not execute `openclaw onboard` unless the user explicitly asks for interactive setup or asks to skip first-run BOOTSTRAP onboarding. After setup, always tell the user they can run `openclaw onboard --skip-bootstrap` if they want the first real task to run without the introductory BOOTSTRAP flow. Do not configure DingTalk unless the user provides DingTalk credentials or asks for DingTalk access.
 
 ## Billing
 
@@ -29,7 +29,7 @@ Default to `--billing payg --region china` when the user does not specify billin
 - Coding Plan: https://bailian.console.aliyun.com/cn-beijing/?tab=model#/efm/coding_plan
 - Token Plan: https://bailian.console.aliyun.com/?tab=plan#/efm/subscription/overview
 
-Use `--region singapore` only for pay-as-you-go Singapore. For deeper billing details, read `references/aliyun-model-studio-openclaw.md`.
+Use `--region singapore` only for pay-as-you-go Singapore. If the user gives a custom Alibaba Cloud compatible endpoint, pass it through with `--base-url`; otherwise use the billing-specific defaults from the official OpenClaw guide. For deeper billing details, read `references/aliyun-model-studio-openclaw.md`.
 
 ## Execute
 
@@ -62,7 +62,8 @@ python3 <install-openclaw-skill-dir>/scripts/install_openclaw.py ...
 
 The authoritative implementation is `scripts/install_openclaw.py`.
 The normal parameters are `--billing`, `--api-key`, `--api-key-env`, `--region`,
-`--model-id`, `--npm-registry`, `--precheck-only`, `--skip-tokenless`, and DingTalk-specific flags.
+`--base-url`, `--model-id`, `--npm-registry`, `--dry-run`, `--precheck-only`,
+`--skip-preflight`, `--skip-tokenless`, and DingTalk-specific flags.
 
 ## Examples
 
@@ -98,6 +99,15 @@ python3 /home/ecs-user/.copilot-shell/skills/install-openclaw/scripts/install_op
   --api-key-env BAILIAN_API_KEY
 ```
 
+Custom endpoint:
+
+```bash
+python3 /home/ecs-user/.copilot-shell/skills/install-openclaw/scripts/install_openclaw.py \
+  --billing payg \
+  --api-key-env BAILIAN_API_KEY \
+  --base-url "https://dashscope.aliyuncs.com/apps/anthropic"
+```
+
 With DingTalk:
 
 ```bash
@@ -113,6 +123,9 @@ python3 /home/ecs-user/.copilot-shell/skills/install-openclaw/scripts/install_op
 
 - Checks Node.js/npm and installs them with `dnf`/`yum` when needed.
 - Runs dependency precheck before installing or writing config.
+- Runs a model endpoint pre-flight check before writing config or starting Gateway. It uses the official Alibaba Cloud OpenClaw `anthropic-messages` shape and validates the resolved API key, Base URL, and model ID. Pass `--skip-preflight` only when the endpoint is temporarily unreachable and the user accepts deferring validation to Gateway startup.
+- With `--dry-run`, still resolves config and runs the model pre-flight check, but skips local install/config/gateway changes. Combine with `--skip-preflight` only for an offline local-flow preview.
+- With `--precheck-only`, checks only local dependencies and prints the API key source; it does not require or validate an API key.
 - Installs OpenClaw with npm unless `--skip-install-openclaw` is passed.
 - Uses npm registry `https://registry.npmmirror.com` by default; override with `--npm-registry`.
 - Writes only OpenClaw schema-supported config fields.
@@ -121,6 +134,7 @@ python3 /home/ecs-user/.copilot-shell/skills/install-openclaw/scripts/install_op
 - Starts OpenClaw through `openclaw gateway install` and `openclaw gateway restart` unless `--skip-gateway` is passed.
 - If the gateway port is occupied by OpenClaw, it clears that stale listener. If the port is occupied by another process, it stops and prints the process details for the user to decide.
 - **Auto-installs the tokenless OpenClaw plugin** after OpenClaw is installed, for token usage tracking and response compression. Pass `--skip-tokenless` to opt out.
+- Prints first-run BOOTSTRAP guidance by default. Tell the user `openclaw onboard --skip-bootstrap` keeps the first real task from being interrupted by OpenClaw's introductory `BOOTSTRAP.md` flow, and that they can still adjust `IDENTITY.md`, `USER.md`, and `SOUL.md` later under the OpenClaw workspace.
 
 ## Verify
 

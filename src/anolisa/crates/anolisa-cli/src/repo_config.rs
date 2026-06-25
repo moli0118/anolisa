@@ -4,14 +4,14 @@
 //! Design (see the install-backend discussion):
 //!
 //! * **One configuration table per backend** (`[backends.raw]`,
-//!   `[backends.yum]`, `[backends.npm]`) — no repo list, no priorities.
+//!   `[backends.rpm]`, `[backends.npm]`) — no repo list, no priorities.
 //!   Selection is explicit: CLI `--backend` > `default_backend`. There is
 //!   no cross-backend fallback, so the origin of an installed component
 //!   is always deterministic.
 //! * **`base_url` is a directory root**, never a file. The per-backend
 //!   convention decides what lives under it: raw treats it as the
-//!   `v1/` distribution root containing `index.toml`; yum hands it to
-//!   dnf; npm treats it as the registry API root.
+//!   `v1/` distribution root containing `index.toml`; the rpm backend
+//!   hands it to dnf; npm treats it as the registry API root.
 //! * **Variables** `$os` / `$arch` / `$basearch` / `$releasever` /
 //!   `$channel` substitute into `base_url` only. Values come from host
 //!   detection and can be overridden in `[vars]`; an unknown or unset
@@ -67,10 +67,23 @@ pub const RAW_ARTIFACT_FILENAME: &str = "{component}-{version}-{os}-{arch}{ext}"
 /// Code-owned artifact directory layout under a raw `base_url`.
 pub const RAW_ARTIFACT_DIR: &str = "{component}/{version}/{os}/{arch}";
 
-/// Backend names this binary knows how to drive (or will: yum/npm are
+/// Backend names this binary knows how to drive (or will: `rpm`/`npm` are
 /// configuration-valid before their executors land so a site can stage
 /// config ahead of the rollout).
-pub const KNOWN_BACKENDS: &[&str] = &["raw", "yum", "npm"];
+///
+/// `yum` was the first spelling used for the RPM backend in generated
+/// `repo.toml` files. Disk configs using that spelling are normalized to
+/// `rpm` before validation so callers never need to handle both names.
+pub const KNOWN_BACKENDS: &[&str] = &["raw", RPM_BACKEND, "npm"];
+
+const RPM_BACKEND: &str = "rpm";
+const LEGACY_RPM_BACKEND: &str = "yum";
+const LEGACY_RPM_BACKEND_WARNING: &str = concat!(
+    "uses deprecated backend name 'yum'; treating it as 'rpm'. ",
+    "Rename default_backend to 'rpm' and [backends.yum] to [backends.rpm]."
+);
+const LEGACY_RPM_BACKEND_NAME_WARNING: &str =
+    "backend name 'yum' is deprecated; treating it as 'rpm'. Use 'rpm' instead.";
 
 /// Errors surfaced while loading, parsing, or resolving `repo.toml`.
 #[derive(Debug, thiserror::Error)]
@@ -159,6 +172,8 @@ pub struct RepoConfig {
     pub vars: RepoVars,
     #[serde(default)]
     pub backends: BTreeMap<String, BackendConfig>,
+    #[serde(skip)]
+    legacy_rpm_backend: bool,
 }
 
 /// `[vars]` overrides for `base_url` substitution. Every field is
@@ -175,7 +190,7 @@ pub struct RepoVars {
 
 /// One `[backends.<name>]` table. A single struct covers all backend
 /// kinds; fields irrelevant to a kind are simply unused (e.g. `gpgcheck`
-/// outside yum) — the executor for each backend consumes its own subset.
+/// outside rpm) — the executor for each backend consumes its own subset.
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct BackendConfig {
@@ -184,10 +199,10 @@ pub struct BackendConfig {
     /// Opt-in for plaintext `http://` sources.
     #[serde(default)]
     pub insecure: bool,
-    /// yum: signature verification toggle, handed to dnf.
+    /// rpm: signature verification toggle, handed to dnf.
     ///
     /// This and the two raw cache knobs below are deserialized for the
-    /// executors that will consume them (yum delegation / raw index
+    /// executors that will consume them (rpm delegation / raw index
     /// cache); nothing reads them during resolution, hence the narrow
     /// dead-code allowance until those land.
     #[serde(default)]
@@ -233,11 +248,15 @@ impl RepoConfig {
             if let Some(path) = candidate.as_deref()
                 && path.is_file()
             {
-                return Self::from_path(path);
+                let config = Self::from_path(path)?;
+                config.emit_deprecation_warnings(path);
+                return Ok(config);
             }
         }
         if let Some(embedded) = sources.embedded {
-            return Self::parse_with_path(embedded, Path::new("<embedded>"));
+            let config = Self::parse_with_path(embedded, Path::new("<embedded>"))?;
+            config.emit_deprecation_warnings(Path::new("<embedded>"));
+            return Ok(config);
         }
         Err(RepoConfigError::NotFound)
     }
@@ -260,12 +279,53 @@ impl RepoConfig {
     }
 
     fn parse_with_path(s: &str, path: &Path) -> Result<Self, RepoConfigError> {
-        let parsed: RepoConfig = toml::from_str(s).map_err(|source| RepoConfigError::Parse {
-            path: path.to_path_buf(),
-            source,
-        })?;
+        let mut parsed: RepoConfig =
+            toml::from_str(s).map_err(|source| RepoConfigError::Parse {
+                path: path.to_path_buf(),
+                source,
+            })?;
+        parsed.normalize_legacy_backend_names();
         parsed.validate()?;
         Ok(parsed)
+    }
+
+    pub(crate) fn canonical_backend_name(name: &str) -> &str {
+        if name == LEGACY_RPM_BACKEND {
+            RPM_BACKEND
+        } else {
+            name
+        }
+    }
+
+    pub(crate) fn backend_name_deprecation_warning(name: &str) -> Option<&'static str> {
+        (name == LEGACY_RPM_BACKEND).then_some(LEGACY_RPM_BACKEND_NAME_WARNING)
+    }
+
+    fn normalize_legacy_backend_names(&mut self) {
+        let default_was_legacy = self.default_backend == LEGACY_RPM_BACKEND;
+        let legacy_backend = self.backends.remove(LEGACY_RPM_BACKEND);
+        let backend_was_legacy = legacy_backend.is_some();
+
+        if self.default_backend == LEGACY_RPM_BACKEND {
+            self.default_backend = RPM_BACKEND.to_string();
+        }
+        if let Some(legacy) = legacy_backend {
+            self.backends
+                .entry(RPM_BACKEND.to_string())
+                .or_insert(legacy);
+        }
+        self.legacy_rpm_backend = default_was_legacy || backend_was_legacy;
+    }
+
+    pub(crate) fn deprecation_warning(&self) -> Option<&'static str> {
+        self.legacy_rpm_backend
+            .then_some(LEGACY_RPM_BACKEND_WARNING)
+    }
+
+    fn emit_deprecation_warnings(&self, path: &Path) {
+        if let Some(warning) = self.deprecation_warning() {
+            eprintln!("warning: repo config at {} {warning}", path.display());
+        }
     }
 
     /// Structural validation run on every successful parse:
@@ -308,7 +368,7 @@ impl RepoConfig {
         &self,
         cli_override: Option<&str>,
     ) -> Result<(&str, &BackendConfig), RepoConfigError> {
-        let name = cli_override.unwrap_or(&self.default_backend);
+        let name = Self::canonical_backend_name(cli_override.unwrap_or(&self.default_backend));
         if !KNOWN_BACKENDS.contains(&name) {
             return Err(RepoConfigError::UnknownBackend {
                 name: name.to_string(),
@@ -335,8 +395,8 @@ impl RepoConfig {
         let values: BTreeMap<&str, Option<String>> = BTreeMap::from([
             ("os", Some(self.vars.os.clone().unwrap_or(host.os.clone()))),
             ("arch", Some(arch.clone())),
-            // $basearch is a yum-ism alias of $arch; kept so existing
-            // yum baseurls can be pasted verbatim.
+            // $basearch is a dnf/rpm-style alias of $arch; kept so existing
+            // dnf baseurls can be pasted verbatim.
             ("basearch", Some(arch)),
             // No host probe for the distro release yet — referencing
             // $releasever without a [vars] override is an error.
@@ -667,9 +727,11 @@ base_url = "https://pypi.org"
 
     #[test]
     fn default_backend_without_table_is_rejected() {
+        // `rpm` is a known backend but has no `[backends.rpm]` table here, so
+        // the default-backend presence check (not the allow-list) must fire.
         let err = RepoConfig::from_toml_str(
             r#"schema_version = 1
-default_backend = "yum"
+default_backend = "rpm"
 [backends.raw]
 base_url = "file:///srv/repo"
 "#,
@@ -677,8 +739,40 @@ base_url = "file:///srv/repo"
         .expect_err("must reject");
         assert!(matches!(
             err,
-            RepoConfigError::DefaultBackendNotConfigured { name } if name == "yum"
+            RepoConfigError::DefaultBackendNotConfigured { name } if name == "rpm"
         ));
+    }
+
+    #[test]
+    fn legacy_yum_backend_table_is_migrated_to_rpm() {
+        let cfg = RepoConfig::from_toml_str(
+            r#"schema_version = 1
+default_backend = "yum"
+[backends.yum]
+base_url = "https://mirrors.openanolis.cn/anolis/23/agents/$basearch/"
+[backends.yum.package_map]
+agentsight = "anolis-agentsight"
+"#,
+        )
+        .expect("legacy yum spelling must load");
+
+        assert_eq!(cfg.default_backend, "rpm");
+        assert!(
+            cfg.deprecation_warning()
+                .is_some_and(|warning| warning.contains("deprecated backend name 'yum'"))
+        );
+        assert!(!cfg.backends.contains_key("yum"));
+        assert!(cfg.backends.contains_key("rpm"));
+        let (name, backend) = cfg.select_backend(None).expect("default backend");
+        assert_eq!(name, "rpm");
+        assert_eq!(
+            cfg.resolved_base_url(name, backend, &host()).expect("url"),
+            "https://mirrors.openanolis.cn/anolis/23/agents/x86_64"
+        );
+        assert_eq!(
+            cfg.package_name(backend, "agentsight", None),
+            "anolis-agentsight"
+        );
     }
 
     #[test]
@@ -730,14 +824,14 @@ base_url = "file:///srv/repo"
         ));
     }
 
-    fn yum_cfg(vars: &str) -> RepoConfig {
+    fn rpm_cfg(vars: &str) -> RepoConfig {
         RepoConfig::from_toml_str(&format!(
             r#"schema_version = 1
-default_backend = "yum"
+default_backend = "rpm"
 {vars}
-[backends.yum]
+[backends.rpm]
 base_url = "https://mirrors.openanolis.cn/anolis/$releasever/agents/$basearch/"
-[backends.yum.package_map]
+[backends.rpm.package_map]
 agentsight = "anolis-agentsight"
 "#
         ))
@@ -746,8 +840,8 @@ agentsight = "anolis-agentsight"
 
     #[test]
     fn variable_substitution_uses_vars_overrides_and_detection() {
-        let cfg = yum_cfg("[vars]\nreleasever = \"23\"");
-        let (name, backend) = cfg.select_backend(None).expect("yum");
+        let cfg = rpm_cfg("[vars]\nreleasever = \"23\"");
+        let (name, backend) = cfg.select_backend(None).expect("rpm");
         let url = cfg.resolved_base_url(name, backend, &host()).expect("url");
         // $releasever from [vars], $basearch from host detection,
         // trailing slash trimmed.
@@ -756,8 +850,8 @@ agentsight = "anolis-agentsight"
 
     #[test]
     fn unset_releasever_is_a_hard_error() {
-        let cfg = yum_cfg("");
-        let (name, backend) = cfg.select_backend(None).expect("yum");
+        let cfg = rpm_cfg("");
+        let (name, backend) = cfg.select_backend(None).expect("rpm");
         let err = cfg
             .resolved_base_url(name, backend, &host())
             .expect_err("must reject");
@@ -789,9 +883,17 @@ base_url = "https://example.com/$typo_var/repo"
 
     #[test]
     fn select_backend_cli_override_and_unconfigured_error() {
-        let cfg = yum_cfg("[vars]\nreleasever = \"23\"");
-        let (name, _) = cfg.select_backend(Some("yum")).expect("explicit yum");
-        assert_eq!(name, "yum");
+        let cfg = rpm_cfg("[vars]\nreleasever = \"23\"");
+        let (name, _) = cfg.select_backend(Some("rpm")).expect("explicit rpm");
+        assert_eq!(name, "rpm");
+        let (name, _) = cfg
+            .select_backend(Some("yum"))
+            .expect("legacy explicit yum");
+        assert_eq!(name, "rpm");
+        assert!(
+            RepoConfig::backend_name_deprecation_warning("yum")
+                .is_some_and(|warning| warning.contains("deprecated"))
+        );
         let err = cfg
             .select_backend(Some("npm"))
             .expect_err("npm not configured");
@@ -891,20 +993,20 @@ base_url = "https://example.com/$typo_var/repo"
 
     #[test]
     fn package_name_chain_cli_then_map_then_scope_then_component() {
-        let cfg = yum_cfg("[vars]\nreleasever = \"23\"");
-        let (_, yum) = cfg.select_backend(None).expect("yum");
+        let cfg = rpm_cfg("[vars]\nreleasever = \"23\"");
+        let (_, rpm) = cfg.select_backend(None).expect("rpm");
         // CLI override wins over the map.
         assert_eq!(
-            cfg.package_name(yum, "agentsight", Some("agentsight-0917test")),
+            cfg.package_name(rpm, "agentsight", Some("agentsight-0917test")),
             "agentsight-0917test"
         );
         // package_map applies.
         assert_eq!(
-            cfg.package_name(yum, "agentsight", None),
+            cfg.package_name(rpm, "agentsight", None),
             "anolis-agentsight"
         );
         // Fallback is the component name itself.
-        assert_eq!(cfg.package_name(yum, "tokenless", None), "tokenless");
+        assert_eq!(cfg.package_name(rpm, "tokenless", None), "tokenless");
 
         // npm scope prefixes the default name.
         let npm_cfg = RepoConfig::from_toml_str(

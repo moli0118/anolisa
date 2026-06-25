@@ -7,6 +7,9 @@
  */
 
 import { execFile } from "child_process";
+import { writeFileSync, unlinkSync, mkdtempSync, rmdirSync } from "fs";
+import { join } from "path";
+import { tmpdir } from "os";
 import { promisify } from "util";
 import type { CommandOutput } from "./types.js";
 import { pluginState } from "./state.js";
@@ -57,7 +60,7 @@ export class CommandExecutor {
    *
    * Equivalent to:
    * ```
-   * ws-ckpt checkpoint --workspace <ws> --id <id> [--message <msg>] [--metadata <json>]
+   * ws-ckpt checkpoint --workspace <ws> --snapshot <id> [--message <msg>] [--metadata <json>]
    * ```
    *
    * @param workspace - Workspace directory path.
@@ -72,7 +75,7 @@ export class CommandExecutor {
     const args = [
       "checkpoint",
       "--workspace", workspace,
-      "--id", id,
+      "--snapshot", id,
     ];
 
     if (options?.message) {
@@ -87,15 +90,34 @@ export class CommandExecutor {
   }
 
   /**
-   * Roll back the workspace to a specific snapshot.
+   * Roll back the workspace to a specific snapshot or N ancestors back.
    *
-   * Equivalent to: `ws-ckpt rollback --workspace <ws> --snapshot <target>`
-   *
-   * @param workspace - Workspace directory path.
-   * @param target    - Snapshot identifier or name to roll back to.
+   * @param workspace     - Workspace directory path.
+   * @param target        - Snapshot identifier (mutually exclusive with numAncestors).
+   * @param numAncestors  - Number of ancestors to traverse (mutually exclusive with target).
+   * @param preview       - Show changes without executing the rollback.
    */
-  public async rollback(workspace: string, target: string): Promise<CommandOutput> {
-    return this.run(["rollback", "--workspace", workspace, "--snapshot", target]);
+  public async rollback(
+    workspace: string,
+    target?: string,
+    numAncestors?: number,
+    preview: boolean = false,
+  ): Promise<CommandOutput> {
+    if (!target && numAncestors === undefined) {
+      throw new Error("Either 'target' or 'numAncestors' is required");
+    }
+    const args = ["rollback", "--workspace", workspace];
+    if (numAncestors !== undefined) {
+      // Plugin snapshots after each response, so head == current state;
+      // +1 so user's "go back 1 step" skips the head snapshot.
+      args.push("--num-ancestors", String(numAncestors + 1));
+    } else if (target) {
+      args.push("--snapshot", target);
+    }
+    if (preview) {
+      args.push("--preview");
+    }
+    return this.run(args);
   }
 
   /**
@@ -142,21 +164,20 @@ export class CommandExecutor {
   }
 
   /**
-   * Show the diff between two snapshots.
+   * Show the diff between two snapshots, or between a snapshot and the current workspace.
    *
-   * Equivalent to: `ws-ckpt diff --workspace <ws> --from <a> --to <b>`
+   * Equivalent to: `ws-ckpt diff --workspace <ws> --from <a> [--to <b>]`
    *
    * @param workspace - Workspace directory path.
    * @param from      - Source snapshot identifier or name.
-   * @param to        - Target snapshot identifier or name.
+   * @param to        - Target snapshot identifier or name. Omit to diff against current workspace.
    */
-  public async diff(workspace: string, from: string, to: string): Promise<CommandOutput> {
-    return this.run([
-      "diff",
-      "--workspace", workspace,
-      "--from", from,
-      "--to", to,
-    ]);
+  public async diff(workspace: string, from: string, to?: string): Promise<CommandOutput> {
+    const args = ["diff", "--workspace", workspace, "--from", from];
+    if (to) {
+      args.push("--to", to);
+    }
+    return this.run(args);
   }
 
   /**
@@ -250,6 +271,7 @@ export class CommandExecutor {
       const { stdout, stderr } = await execFileAsync(WS_CKPT_BIN, args, {
         timeout: this.timeoutMs,
         encoding: "utf-8",
+        env: { ...process.env, WS_CKPT_AGENT_NAME: "openclaw" },
       });
 
       return {
@@ -272,5 +294,70 @@ export class CommandExecutor {
         stderr: err.stderr ?? err.message ?? "Unknown command error",
       };
     }
+  }
+
+}
+
+export function extractTiming(stdout: string): string {
+  const match = stdout.match(/^(Completed in .+|Failed after .+)$/m);
+  return match ? ` (${match[1]})` : "";
+}
+
+/**
+ * Execute a crontab command. Returns structured output, never throws.
+ * When input is provided, writes to a temp file and runs `crontab <file>`
+ * instead of stdin — execFile does not support the input option.
+ */
+export async function runCrontab(
+  args: string[],
+  opts?: { input?: string; timeout?: number },
+): Promise<CommandOutput> {
+  const timeout = opts?.timeout ?? 10_000;
+
+  if (opts?.input !== undefined) {
+    const tmpDir = mkdtempSync(join(tmpdir(), "ws-ckpt-cron-"));
+    const tmpFile = join(tmpDir, "crontab");
+    try {
+      writeFileSync(tmpFile, opts.input, "utf-8");
+      const { stdout, stderr } = await execFileAsync("crontab", [tmpFile], {
+        timeout,
+        encoding: "utf-8",
+      });
+      return { exitCode: 0, stdout: String(stdout ?? ""), stderr: String(stderr ?? "") };
+    } catch (error: unknown) {
+      const err = error as {
+        code?: number | string;
+        stdout?: string;
+        stderr?: string;
+        message?: string;
+      };
+      return {
+        exitCode: typeof err.code === "number" ? err.code : 1,
+        stdout: err.stdout ?? "",
+        stderr: err.stderr ?? err.message ?? "Unknown command error",
+      };
+    } finally {
+      try { unlinkSync(tmpFile); rmdirSync(tmpDir); } catch { /* cleanup best-effort */ }
+    }
+  }
+
+  try {
+    const { stdout, stderr } = await execFileAsync("crontab", args, {
+      timeout,
+      encoding: "utf-8",
+    });
+    return { exitCode: 0, stdout: String(stdout ?? ""), stderr: String(stderr ?? "") };
+  } catch (error: unknown) {
+    const err = error as {
+      code?: number | string;
+      stdout?: string;
+      stderr?: string;
+      message?: string;
+    };
+    return {
+      exitCode: typeof err.code === "number" ? err.code : 1,
+      stdout: err.stdout ?? "",
+      stderr: err.stderr ?? err.message ?? "Unknown command error",
+    };
   }
 }

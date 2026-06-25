@@ -32,9 +32,31 @@ pub async fn dispatch(state: &Arc<DaemonState>, request: Request) -> Response {
                 }
             },
         },
-        Request::Rollback { workspace, to } => match state.ensure_bootstrapped().await {
+        Request::Rollback {
+            workspace,
+            to,
+            num_ancestors,
+        } => match state.ensure_bootstrapped().await {
             Err(e) => Err(e),
-            Ok(()) => crate::snapshot_mgr::rollback(state, &workspace, &to).await,
+            Ok(()) => {
+                crate::snapshot_mgr::rollback(state, &workspace, to.as_deref(), num_ancestors).await
+            }
+        },
+        Request::RollbackPreview {
+            workspace,
+            to,
+            num_ancestors,
+        } => match state.ensure_bootstrapped().await {
+            Err(e) => Err(e),
+            Ok(()) => {
+                crate::snapshot_mgr::rollback_preview(
+                    state,
+                    &workspace,
+                    to.as_deref(),
+                    num_ancestors,
+                )
+                .await
+            }
         },
         Request::Delete {
             workspace,
@@ -100,7 +122,9 @@ pub async fn dispatch(state: &Arc<DaemonState>, request: Request) -> Response {
             to,
         } => match state.ensure_bootstrapped().await {
             Err(e) => Err(e),
-            Ok(()) => crate::snapshot_mgr::diff_snapshots(state, &workspace, &from, &to).await,
+            Ok(()) => {
+                crate::snapshot_mgr::diff_snapshots(state, &workspace, &from, to.as_deref()).await
+            }
         },
         Request::Status { workspace } => {
             // Inline status query logic
@@ -710,7 +734,8 @@ mod tests {
         ));
         let req = Request::Rollback {
             workspace: "/nonexistent/path/12345".to_string(),
-            to: "msg1-step0".to_string(),
+            to: Some("msg1-step0".to_string()),
+            num_ancestors: None,
         };
         let resp = dispatch(&state, req).await;
         match resp {
@@ -797,7 +822,8 @@ mod tests {
         let tmpdir = tempfile::tempdir().unwrap();
         let req = Request::Rollback {
             workspace: tmpdir.path().to_string_lossy().to_string(),
-            to: "msg1-step0".to_string(),
+            to: Some("msg1-step0".to_string()),
+            num_ancestors: None,
         };
         let resp = dispatch(&state, req).await;
         match resp {
@@ -892,7 +918,7 @@ mod tests {
         let req = Request::Diff {
             workspace: "/nonexistent/path/12345".to_string(),
             from: "msg1-step0".to_string(),
-            to: "msg2-step0".to_string(),
+            to: Some("msg2-step0".to_string()),
         };
         let resp = dispatch(&state, req).await;
         match resp {

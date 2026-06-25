@@ -26,6 +26,17 @@ pub struct HostEnv {
     pub user_home: Option<PathBuf>,
 }
 
+/// A skill declared in the component manifest, with an optional resolved
+/// source path for the skill bundle.
+#[derive(Debug, Clone)]
+pub struct DeclaredSkill {
+    /// Skill name.
+    pub name: String,
+    /// Resolved source directory. When `None`, the driver falls back to
+    /// `<resource_root>/skills/<name>/`.
+    pub source: Option<PathBuf>,
+}
+
 /// Detection outcome for a framework.
 #[derive(Debug, Clone, Serialize)]
 pub struct DetectResult {
@@ -51,6 +62,18 @@ pub struct DriverCtx<'a> {
     /// Plugin id declared in the component's adapter manifest, if any.
     /// A driver may fall back to it when the bundle does not name one.
     pub declared_plugin_id: Option<String>,
+    /// Skills declared in the component's adapter manifest. Each entry
+    /// carries an optional resolved `source` path; when absent, the driver
+    /// falls back to `<resource_root>/skills/<name>/`.
+    pub declared_skills: Vec<DeclaredSkill>,
+    /// Post-install config key/value pairs declared in the component's
+    /// adapter manifest. The driver applies these via the framework CLI.
+    pub declared_config: Vec<crate::manifest::AdapterConfigSetSpec>,
+    /// Bundle entry-point filename from the manifest (framework-specific
+    /// section preferred over generic `[adapters.bundle]`). The driver
+    /// should use this to locate the framework-native manifest inside
+    /// the resource root instead of hardcoding a filename.
+    pub declared_bundle_entry: Option<String>,
     /// True when the caller passed `--dry-run`; drivers must not mutate
     /// framework state in this mode (the Manager also guards this).
     pub dry_run: bool,
@@ -254,6 +277,36 @@ pub trait AdapterOps {
     /// A non-zero exit or a timeout is reported through [`CliOutput`], not
     /// as an error, so the driver decides how to interpret it.
     fn run_framework_cli(&self, cmd: FrameworkCommand) -> Result<CliOutput, AdapterError>;
+
+    /// Recursively copy a directory tree from `src` to `dst`. The Manager
+    /// validates that `dst` is under an allowed external root before
+    /// executing. `src` must be under the resource root or an allowed
+    /// root. Creates `dst` and any missing parents.
+    ///
+    /// # Errors
+    ///
+    /// [`AdapterError::Io`] on filesystem failure;
+    /// [`AdapterError::ClaimValidation`] if `dst` fails boundary check.
+    fn copy_tree(&self, src: &Path, dst: &Path) -> Result<(), AdapterError>;
+
+    /// Copy a single file from `src` to `dst`. Both paths are validated
+    /// against the allowed roots. Creates parent directories of `dst`.
+    ///
+    /// # Errors
+    ///
+    /// [`AdapterError::Io`] on filesystem failure;
+    /// [`AdapterError::ClaimValidation`] if either path fails boundary check.
+    fn copy_file(&self, src: &Path, dst: &Path) -> Result<(), AdapterError>;
+
+    /// Remove a directory tree rooted at `path`. The Manager validates
+    /// that `path` is under an allowed external root before executing.
+    /// Returns `Ok(false)` when the path does not exist (idempotent).
+    ///
+    /// # Errors
+    ///
+    /// [`AdapterError::Io`] on filesystem failure;
+    /// [`AdapterError::ClaimValidation`] if `path` fails boundary check.
+    fn remove_tree(&self, path: &Path) -> Result<bool, AdapterError>;
 }
 
 // ---------------------------------------------------------------------------

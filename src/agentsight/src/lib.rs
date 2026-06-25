@@ -40,9 +40,12 @@ pub mod probes;
 
 // Re-export config types
 pub use config::{AgentsightConfig, default_base_path};
+#[cfg(feature = "server")]
+pub mod agent_sec;
 pub mod aggregator;
 pub mod analyzer;
 pub mod atif;
+pub(crate) mod background;
 pub mod chrome_trace;
 pub mod discovery;
 pub mod event;
@@ -59,6 +62,18 @@ pub mod storage;
 pub mod tokenizer;
 mod unified;
 pub mod utils;
+
+#[cfg(all(test, feature = "server"))]
+mod tests {
+    #[test]
+    fn agent_sec_module_is_available_with_server_feature() {
+        let socket_path = std::path::PathBuf::from("agent-sec-daemon.sock");
+        let client = crate::agent_sec::AgentSecClient::new(Some(socket_path.clone()))
+            .expect("server feature should expose the agent-sec client");
+
+        assert_eq!(client.socket_path(), &socket_path);
+    }
+}
 
 // Re-export common types for convenience
 pub use aggregator::{

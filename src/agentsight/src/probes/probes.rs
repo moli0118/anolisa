@@ -22,8 +22,8 @@ use super::filewatch::{FileWatch, RawFileWatchEvent};
 use super::filewrite::{FileWrite as FileWriteProbe, RawFileWriteEvent};
 use super::procmon::{ProcMon, ProcMonEvent};
 use super::proctrace::{ProcEventHeader, ProcTrace, VariableEvent};
+use super::shared_maps::SharedMaps;
 use super::sslsniff::SslSniff;
-use super::sslsniff::bpf::probe_SSL_data_t as RawSslEvent;
 use super::tcpsniff::TcpSniff;
 use super::udpdns::{RawUdpDnsEvent, UdpDns};
 use crate::config::TcpTarget;
@@ -119,62 +119,54 @@ impl Probes {
         )
         .context("failed to create proctrace")?;
 
-        // Get handles to the shared maps for reuse
-        let map_handle = proctrace
-            .traced_processes_handle()
-            .context("failed to get traced_processes handle")?;
+        // Ring buffer handle kept for the polling thread (see `run`).
         let rb_handle = proctrace.rb_handle().context("failed to get rb handle")?;
 
-        // Only fetch a cgroup_filter handle when the feature is on; when off,
-        // we let each probe load its own private (unused) cgroup_filter map
-        // so we never burn an extra fd in the steady state.
-        let cgroup_filter_handle = if cgroup_filter_enabled {
-            Some(
+        // Bundle the maps proctrace owns so every follower probe can reuse them
+        // through a single `&SharedMaps` argument instead of a growing list of
+        // individual `&MapHandle` parameters.
+        //
+        // The cgroup_filter handle is only fetched when the feature is on; when
+        // off, each probe loads its own private (unused) cgroup_filter map so we
+        // never burn an extra fd in the steady state.
+        let mut shared = SharedMaps::new(proctrace.rb_handle().context("failed to get rb handle")?)
+            .with_traced_processes(
+                proctrace
+                    .traced_processes_handle()
+                    .context("failed to get traced_processes handle")?,
+            )
+            .with_cgroup_filter_enabled(cgroup_filter_enabled);
+        if cgroup_filter_enabled {
+            shared = shared.with_cgroup_filter(
                 proctrace
                     .cgroup_filter_handle()
                     .context("failed to get cgroup_filter handle")?,
-            )
-        } else {
-            None
-        };
-        let cgroup_filter_ref = cgroup_filter_handle.as_ref();
+            );
+        }
 
-        // Create sslsniff - it will reuse both the traced_processes map and ring buffer
-        let sslsniff = SslSniff::new_with_traced_processes(Some(&map_handle), Some(&rb_handle))
-            .context("failed to create sslsniff")?;
+        // Create sslsniff - reuses the shared ring buffer and process filter.
+        let sslsniff = SslSniff::new_with_shared(&shared).context("failed to create sslsniff")?;
 
-        // Create procmon - it reuses the ring buffer (no cgroup filter: full audit)
-        let procmon = ProcMon::new_with_rb(&rb_handle).context("failed to create procmon")?;
+        // Create procmon - reuses the ring buffer only (no cgroup filter: full audit)
+        let procmon = ProcMon::new_with_shared(&shared).context("failed to create procmon")?;
 
-        // Optionally create filewatch - it reuses both the traced_processes map and ring buffer
+        // Optionally create filewatch - reuses ring buffer + process/cgroup filters
         let filewatch = if enable_filewatch {
-            let fw = FileWatch::new_with_full_maps(
-                &map_handle,
-                &rb_handle,
-                cgroup_filter_ref,
-                cgroup_filter_enabled,
-            )
-            .context("failed to create filewatch")?;
+            let fw = FileWatch::new_with_shared(&shared).context("failed to create filewatch")?;
             Some(fw)
         } else {
             log::info!("FileWatch probe disabled");
             None
         };
 
-        // Create filewrite - it reuses both the traced_processes map and ring buffer (always enabled)
-        let filewrite = FileWriteProbe::new_with_full_maps(
-            &map_handle,
-            &rb_handle,
-            cgroup_filter_ref,
-            cgroup_filter_enabled,
-        )
-        .context("failed to create filewrite")?;
+        // Create filewrite - reuses ring buffer + process/cgroup filters (always enabled)
+        let filewrite =
+            FileWriteProbe::new_with_shared(&shared).context("failed to create filewrite")?;
 
-        // Optionally create udpdns - it reuses traced_processes map and ring buffer
+        // Optionally create udpdns - reuses ring buffer + process filter
         // Skips already-traced processes to avoid redundant discovery events
         let udpdns = if enable_udpdns {
-            let dns = UdpDns::new_with_maps(&map_handle, &rb_handle)
-                .context("failed to create udpdns")?;
+            let dns = UdpDns::new_with_shared(&shared).context("failed to create udpdns")?;
             Some(dns)
         } else {
             log::info!("UDP DNS probe disabled (no https/http domain rules configured)");
@@ -184,7 +176,7 @@ impl Probes {
         // Optionally create tcpsniff - captures plain HTTP traffic to configured IP/port targets
         let tcpsniff = if !tcp_targets.is_empty() {
             let mut tcp =
-                TcpSniff::new_with_maps(&rb_handle).context("failed to create tcpsniff")?;
+                TcpSniff::new_with_shared(&shared).context("failed to create tcpsniff")?;
             tcp.set_targets(tcp_targets)
                 .context("failed to set tcp targets")?;
             Some(tcp)
@@ -255,7 +247,6 @@ impl Probes {
     /// events as unified Event type to the channel.
     pub fn run(&self) -> Result<ProbesPoller> {
         let proc_min_sz = mem::size_of::<ProcEventHeader>();
-        let ssl_event_size = mem::size_of::<RawSslEvent>();
         let procmon_event_size = mem::size_of::<ProcMonEvent>();
         let filewatch_event_size = mem::size_of::<RawFileWatchEvent>();
         let filewrite_event_size = mem::size_of::<RawFileWriteEvent>();
@@ -284,15 +275,9 @@ impl Probes {
                         }
                     }
                     EVENT_SOURCE_SSL => {
-                        // SSL event - convert raw BPF data to user-space SslEvent
-                        if data.len() >= ssl_event_size {
-                            // SAFETY: BPF guarantees layout and alignment
-                            let raw = unsafe { &*(data.as_ptr() as *const RawSslEvent) };
-                            let ssl_event = crate::probes::sslsniff::SslEvent::from_bpf(raw);
-                            Some(Event::Ssl(ssl_event))
-                        } else {
-                            None
-                        }
+                        // SSL records are variable-length (tiered reservation):
+                        // decode by header prefix + buf_size, not a full-struct cast.
+                        crate::probes::sslsniff::SslEvent::from_bytes(data).map(Event::Ssl)
                     }
                     EVENT_SOURCE_PROCMON => {
                         // Process monitor event

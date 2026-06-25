@@ -112,10 +112,14 @@ impl FrameworkDriver for OpenClawDriver {
             });
         }
 
+        let manifest_file = ctx
+            .declared_bundle_entry
+            .as_deref()
+            .unwrap_or("openclaw.plugin.json");
         let plugin_id = ctx
             .declared_plugin_id
             .clone()
-            .or(read_plugin_manifest_id(root)?)
+            .or(read_plugin_manifest_id(root, manifest_file)?)
             .or_else(|| Some(ctx.component.clone()));
 
         Ok(AdapterBundle {
@@ -134,13 +138,36 @@ impl FrameworkDriver for OpenClawDriver {
         validate_plugin_id(&plugin_id)?;
         let home = require_home(ctx)?;
         let cmd = build_install_cmd(&bundle.resource_root, &home, ctx.user_home.as_deref());
+        let mut actions = vec![format!(
+            "register openclaw plugin '{plugin_id}' from {}",
+            bundle.resource_root.display()
+        )];
+
+        for skill in &ctx.declared_skills {
+            let src_display = match skill.source {
+                Some(ref s) => s.display().to_string(),
+                None => format!("{}/skills/{}", bundle.resource_root.display(), skill.name,),
+            };
+            actions.push(format!(
+                "deliver openclaw skill '{}' from {} to {}/skills/{}",
+                skill.name,
+                src_display,
+                home.display(),
+                skill.name,
+            ));
+        }
+        for (i, cfg) in ctx.declared_config.iter().enumerate() {
+            actions.push(format!(
+                "set openclaw config [{i}] {} = {}",
+                cfg.key,
+                config_value_display(&cfg.value)
+            ));
+        }
+
         Ok(DriverPlan {
             framework: self.name().to_string(),
             component: ctx.component.clone(),
-            actions: vec![format!(
-                "register openclaw plugin '{plugin_id}' from {}",
-                bundle.resource_root.display()
-            )],
+            actions,
             register_command: Some(display_command(&cmd)),
         })
     }
@@ -154,7 +181,7 @@ impl FrameworkDriver for OpenClawDriver {
         validate_plugin_id(&plugin_id)?;
         let home = require_home(ctx)?;
 
-        let resources = vec![
+        let mut resources = vec![
             ClaimResource {
                 id: RES_STATE_DIR.to_string(),
                 purpose: "openclaw_state_dir".to_string(),
@@ -170,6 +197,33 @@ impl FrameworkDriver for OpenClawDriver {
             },
         ];
 
+        let mut skill_resources = Vec::new();
+        for skill in &ctx.declared_skills {
+            let res_id = format!("openclaw_skill_{}", skill.name);
+            resources.push(ClaimResource {
+                id: res_id.clone(),
+                purpose: "openclaw_skill".to_string(),
+                kind: ClaimResourceKind::ExternalPath {
+                    path: home.join("skills").join(&skill.name),
+                },
+            });
+            skill_resources.push(res_id);
+        }
+
+        let mut config_resources = Vec::new();
+        for (i, cfg) in ctx.declared_config.iter().enumerate() {
+            let res_id = format!("openclaw_config_{i}");
+            resources.push(ClaimResource {
+                id: res_id.clone(),
+                purpose: "openclaw_config".to_string(),
+                kind: ClaimResourceKind::FrameworkConfig {
+                    framework: self.name().to_string(),
+                    key: cfg.key.clone(),
+                },
+            });
+            config_resources.push(res_id);
+        }
+
         Ok(AdapterClaim {
             claim_schema: CLAIM_SCHEMA_VERSION,
             component: ctx.component.clone(),
@@ -184,6 +238,8 @@ impl FrameworkDriver for OpenClawDriver {
             driver_payload: DriverPayload::OpenClaw(OpenClawClaim {
                 state_dir_resource: RES_STATE_DIR.to_string(),
                 plugin_resource: RES_PLUGIN.to_string(),
+                skill_resources,
+                config_resources,
             }),
         })
     }
@@ -196,17 +252,41 @@ impl FrameworkDriver for OpenClawDriver {
         validate_plugin_id(&plugin_id)?;
         let home = require_home(ctx)?;
 
+        // 1. Register the plugin.
         let cmd = build_install_cmd(&claim.resource_root, &home, ctx.user_home.as_deref());
         let program = cmd.program.clone();
         let output = ctx.ops.run_framework_cli(cmd)?;
-        if output.success() {
-            Ok(())
-        } else {
-            Err(AdapterError::FrameworkCli {
+        if !output.success() {
+            return Err(AdapterError::FrameworkCli {
                 program,
                 reason: cli_failure_reason("plugins install", &output),
-            })
+            });
         }
+
+        // 2. Deliver skills through the Manager's controlled IO.
+        for skill in &ctx.declared_skills {
+            let src = skill
+                .source
+                .clone()
+                .unwrap_or_else(|| ctx.resource_root.join("skills").join(&skill.name));
+            let dst = home.join("skills").join(&skill.name);
+            ctx.ops.copy_tree(&src, &dst)?;
+        }
+
+        // 3. Apply config entries via `openclaw config set <key> <value>`.
+        for cfg in &ctx.declared_config {
+            let cmd = build_config_set_cmd(&cfg.key, &cfg.value, &home, ctx.user_home.as_deref());
+            let program = cmd.program.clone();
+            let output = ctx.ops.run_framework_cli(cmd)?;
+            if !output.success() {
+                return Err(AdapterError::FrameworkCli {
+                    program,
+                    reason: cli_failure_reason("config set", &output),
+                });
+            }
+        }
+
+        Ok(())
     }
 
     fn status(
@@ -308,24 +388,59 @@ impl FrameworkDriver for OpenClawDriver {
         }
 
         let home = require_home(ctx)?;
+        let mut messages = Vec::new();
+        let mut cleanup_complete = true;
+
+        // 1. Unregister the plugin.
         let cmd = build_uninstall_cmd(&plugin_id, &home, ctx.user_home.as_deref());
         let output = ctx.ops.run_framework_cli(cmd)?;
         if output.success() {
-            Ok(DisableReport {
-                cleanup_complete: true,
-                messages: vec![format!("unregistered openclaw plugin '{plugin_id}'")],
-            })
+            messages.push(format!("unregistered openclaw plugin '{plugin_id}'"));
         } else {
             // Keep the receipt (Manager marks cleanup_failed) so disable can
             // be retried — do NOT delete anything else.
-            Ok(DisableReport {
+            return Ok(DisableReport {
                 cleanup_complete: false,
                 messages: vec![format!(
                     "openclaw plugin uninstall failed: {}",
                     cli_failure_reason("plugins uninstall", &output)
                 )],
-            })
+            });
         }
+
+        // 2. Remove delivered skill directories through Manager IO.
+        let skill_resources = claim_skill_resources(claim);
+        for skill_name in &skill_resources {
+            let skill_dir = home.join("skills").join(skill_name);
+            match ctx.ops.remove_tree(&skill_dir) {
+                Ok(true) => messages.push(format!(
+                    "removed openclaw skill dir {}",
+                    skill_dir.display()
+                )),
+                Ok(false) => {} // already gone, idempotent
+                Err(err) => {
+                    messages.push(format!(
+                        "failed to remove skill dir {}: {err}",
+                        skill_dir.display()
+                    ));
+                    cleanup_complete = false;
+                }
+            }
+        }
+
+        // 3. Config entries are NOT reversed on disable (framework-wide
+        //    config should persist).
+        let config_count = claim_config_count(claim);
+        if config_count > 0 {
+            messages.push(format!(
+                "{config_count} openclaw config entries left in place (not reversed on disable)"
+            ));
+        }
+
+        Ok(DisableReport {
+            cleanup_complete,
+            messages,
+        })
     }
 }
 
@@ -530,13 +645,13 @@ fn build_list_cmd(home: &Path, user_home: Option<&Path>) -> FrameworkCommand {
 }
 
 /// Plugin id declared by the OpenClaw-native plugin manifest, when present.
-fn read_plugin_manifest_id(root: &Path) -> Result<Option<String>, AdapterError> {
+fn read_plugin_manifest_id(root: &Path, filename: &str) -> Result<Option<String>, AdapterError> {
     #[derive(serde::Deserialize)]
     struct PluginManifest {
         id: Option<String>,
     }
 
-    let path = root.join("openclaw.plugin.json");
+    let path = root.join(filename);
     let bytes = match std::fs::read(&path) {
         Ok(bytes) => bytes,
         Err(source) if source.kind() == std::io::ErrorKind::NotFound => return Ok(None),
@@ -576,13 +691,193 @@ fn display_command(cmd: &FrameworkCommand) -> String {
     s
 }
 
-/// True when `plugin_id` appears as a whole whitespace-delimited token on
-/// any line of `plugins list` output. Tolerant of decoration like
-/// `- tokenless (v1.2)`.
+/// True when `plugin_id` appears in the `plugins list` output.
+///
+/// Handles three output shapes:
+/// 1. Plain text — each line has whitespace-delimited tokens.
+/// 2. Rich table without wrapping — tokens appear between │ delimiters.
+/// 3. Rich table with wrapping — a cell value is split across
+///    consecutive physical lines within the same column.
+///
+/// ANSI escape codes are stripped before any matching.
 fn list_contains_plugin(stdout: &str, plugin_id: &str) -> bool {
-    stdout
-        .lines()
-        .any(|line| line.split_whitespace().any(|tok| tok == plugin_id))
+    let stripped = strip_ansi(stdout);
+
+    // Fast path: exact whitespace-token match on lines that are NOT
+    // table data lines. Table data lines (containing │/┃/║) must go
+    // through the table parser, because a wrapped cell fragment can
+    // look like a complete token on a single physical line.
+    if stripped.lines().any(|line| {
+        !line.contains(|c: char| is_cell_delimiter(c))
+            && line.split_whitespace().any(|tok| tok == plugin_id)
+    }) {
+        return true;
+    }
+
+    // Table-aware path: parse rows, concatenate wrapped cell text per
+    // column, then search each concatenated cell.
+    table_contains_token(&stripped, plugin_id)
+}
+
+/// Strip ANSI escape sequences (CSI and OSC) from `s`.
+fn strip_ansi(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    let mut chars = s.chars().peekable();
+    while let Some(c) = chars.next() {
+        if c == '\x1b' {
+            match chars.peek() {
+                Some('[') => {
+                    chars.next();
+                    // CSI: consume until a final byte (0x40..=0x7E).
+                    for c in chars.by_ref() {
+                        if matches!(c, '\x40'..='\x7e') {
+                            break;
+                        }
+                    }
+                }
+                Some(']') => {
+                    chars.next();
+                    // OSC: consume until BEL or ST.
+                    for c in chars.by_ref() {
+                        if c == '\x07' {
+                            break;
+                        }
+                        if c == '\x1b' {
+                            if chars.peek() == Some(&'\\') {
+                                chars.next();
+                            }
+                            break;
+                        }
+                    }
+                }
+                _ => {
+                    chars.next();
+                }
+            }
+        } else {
+            out.push(c);
+        }
+    }
+    out
+}
+
+fn is_cell_delimiter(c: char) -> bool {
+    matches!(c, '│' | '┃' | '║')
+}
+
+fn is_border_line(line: &str) -> bool {
+    let trimmed = line.trim();
+    !trimmed.is_empty()
+        && trimmed.chars().all(|c| {
+            is_cell_delimiter(c)
+                || matches!(
+                    c,
+                    '─' | '━'
+                        | '═'
+                        | '┌'
+                        | '┐'
+                        | '└'
+                        | '┘'
+                        | '├'
+                        | '┤'
+                        | '┬'
+                        | '┴'
+                        | '┼'
+                        | '┏'
+                        | '┓'
+                        | '┗'
+                        | '┛'
+                        | '┣'
+                        | '┫'
+                        | '┳'
+                        | '┻'
+                        | '╋'
+                        | '┡'
+                        | '┩'
+                        | '╇'
+                        | '╔'
+                        | '╗'
+                        | '╚'
+                        | '╝'
+                        | '╠'
+                        | '╣'
+                        | '╦'
+                        | '╩'
+                        | '╬'
+                        | ' '
+                )
+        })
+}
+
+/// Extract cell text from a line delimited by │/┃/║. Returns `None`
+/// when the line has no cell delimiters (not a table data line).
+fn extract_cells(line: &str) -> Option<Vec<String>> {
+    let trimmed = line.trim();
+    if !trimmed.contains(|c: char| is_cell_delimiter(c)) {
+        return None;
+    }
+    let parts: Vec<&str> = trimmed.split(|c: char| is_cell_delimiter(c)).collect();
+    if parts.len() < 3 {
+        return None;
+    }
+    // Skip the empty segments before the first and after the last │.
+    let cells: Vec<String> = parts[1..parts.len() - 1]
+        .iter()
+        .map(|cell| cell.trim().to_string())
+        .collect();
+    Some(cells)
+}
+
+/// Parse rich-table output into logical rows (merging physical
+/// continuation lines), then check whether any cell in any row
+/// matches `token` as a whitespace-delimited word.
+///
+/// A continuation line is detected by the *last* column being empty.
+/// In `plugins list` tables the last column is typically Status
+/// (`enabled`/`disabled`), which is always populated on the first
+/// physical line of a row but empty on continuation lines. This
+/// correctly handles the case where *both* Name and ID wrap.
+fn table_contains_token(text: &str, token: &str) -> bool {
+    let mut rows: Vec<Vec<String>> = Vec::new();
+    let mut current: Option<Vec<String>> = None;
+
+    for line in text.lines() {
+        if is_border_line(line) {
+            if let Some(cells) = current.take() {
+                rows.push(cells);
+            }
+            continue;
+        }
+
+        if let Some(cells) = extract_cells(line) {
+            let is_continuation = current.is_some() && cells.last().is_some_and(|c| c.is_empty());
+
+            if is_continuation {
+                if let Some(cur) = current.as_mut() {
+                    for (i, cell) in cells.into_iter().enumerate() {
+                        if i < cur.len() && !cell.is_empty() {
+                            cur[i].push_str(&cell);
+                        }
+                    }
+                }
+            } else {
+                if let Some(prev) = current.take() {
+                    rows.push(prev);
+                }
+                current = Some(cells);
+            }
+        }
+    }
+    if let Some(cells) = current {
+        rows.push(cells);
+    }
+
+    rows.iter().any(|row| {
+        row.iter().any(|cell| {
+            let trimmed = cell.trim();
+            trimmed == token || trimmed.split_whitespace().any(|t| t == token)
+        })
+    })
 }
 
 /// Extract the validated plugin id from a claim's `FrameworkPlugin`
@@ -701,6 +996,70 @@ fn collect_files(dir: &Path, out: &mut Vec<PathBuf>) -> std::io::Result<()> {
     Ok(())
 }
 
+/// Build `openclaw config set <key> <value>`.
+fn build_config_set_cmd(
+    key: &str,
+    value: &toml::Value,
+    home: &Path,
+    user_home: Option<&Path>,
+) -> FrameworkCommand {
+    base_cmd(
+        vec![
+            "config".to_string(),
+            "set".to_string(),
+            key.to_string(),
+            config_value_to_cli_string(value),
+        ],
+        home,
+        user_home,
+    )
+}
+
+/// Convert a TOML value to a string suitable for the `openclaw config set`
+/// CLI argument. Strings are passed bare (no quotes); other types use the
+/// TOML display representation.
+fn config_value_to_cli_string(value: &toml::Value) -> String {
+    match value {
+        toml::Value::String(s) => s.clone(),
+        toml::Value::Integer(i) => i.to_string(),
+        toml::Value::Float(f) => f.to_string(),
+        toml::Value::Boolean(b) => b.to_string(),
+        other => other.to_string(),
+    }
+}
+
+/// Human-readable display of a config value for plan output.
+fn config_value_display(value: &toml::Value) -> String {
+    match value {
+        toml::Value::String(s) => format!("\"{s}\""),
+        other => other.to_string(),
+    }
+}
+
+/// Extract skill names from a claim's `skill_resources` by parsing the
+/// resource ids. Each id has the form `openclaw_skill_<name>`, and we
+/// extract `<name>` as the directory name under `<home>/skills/`.
+fn claim_skill_resources(claim: &AdapterClaim) -> Vec<String> {
+    let payload = match &claim.driver_payload {
+        DriverPayload::OpenClaw(oc) => oc,
+        _ => return Vec::new(),
+    };
+    payload
+        .skill_resources
+        .iter()
+        .filter_map(|id| id.strip_prefix("openclaw_skill_"))
+        .map(str::to_string)
+        .collect()
+}
+
+/// Count config resources in a claim's OpenClaw payload.
+fn claim_config_count(claim: &AdapterClaim) -> usize {
+    match &claim.driver_payload {
+        DriverPayload::OpenClaw(oc) => oc.config_resources.len(),
+        _ => 0,
+    }
+}
+
 /// ISO 8601 UTC timestamp, second precision.
 fn now_iso8601() -> String {
     use chrono::{SecondsFormat, Utc};
@@ -717,6 +1076,123 @@ mod tests {
         assert!(list_contains_plugin("- tokenless (v1.2)\n", "tokenless"));
         assert!(!list_contains_plugin("tokenless-extra\n", "tokenless"));
         assert!(!list_contains_plugin("", "tokenless"));
+    }
+
+    #[test]
+    fn list_contains_plugin_strips_ansi() {
+        let ansi_output = "\x1b[1m\x1b[32magent-sec\x1b[0m\nother\n";
+        assert!(list_contains_plugin(ansi_output, "agent-sec"));
+        assert!(!list_contains_plugin(ansi_output, "not-here"));
+    }
+
+    #[test]
+    fn list_contains_plugin_rich_table_no_wrap() {
+        let table = "\
+┏━━━━━━━━━━━━━━━━━━━━┳━━━━━━━━━━━━━┳━━━━━━━━━┓
+┃ Name               ┃ ID          ┃ Status  ┃
+┡━━━━━━━━━━━━━━━━━━━━╇━━━━━━━━━━━━━╇━━━━━━━━━┩
+│ Agent Security     │ agent-sec   │ enabled │
+└────────────────────┴─────────────┴─────────┘
+";
+        assert!(list_contains_plugin(table, "agent-sec"));
+        assert!(!list_contains_plugin(table, "not-here"));
+        assert!(!list_contains_plugin(table, "agent-sec-extra"));
+    }
+
+    #[test]
+    fn list_contains_plugin_rich_table_wrapped() {
+        let table = "\
+┏━━━━━━━━━━━━━━━━━┳━━━━━━━━━━━━━━━━━━━┳━━━━━━━━━┓
+┃ Name            ┃ ID                ┃ Status  ┃
+┡━━━━━━━━━━━━━━━━━╇━━━━━━━━━━━━━━━━━━━╇━━━━━━━━━┩
+│ Agent Security  │ agent-sec-core-op │ enabled │
+│                 │ enclaw-plugin     │         │
+└─────────────────┴───────────────────┴─────────┘
+";
+        assert!(list_contains_plugin(
+            table,
+            "agent-sec-core-openclaw-plugin"
+        ));
+        assert!(!list_contains_plugin(table, "agent-sec"));
+    }
+
+    #[test]
+    fn list_contains_plugin_rich_table_ansi_wrapped() {
+        let table = "\
+\x1b[1m┏━━━━━━━━━━━━━━━━━┳━━━━━━━━━━━━━━━━━━━┳━━━━━━━━━┓\x1b[0m
+\x1b[1m┃\x1b[0m Name            \x1b[1m┃\x1b[0m ID                \x1b[1m┃\x1b[0m Status  \x1b[1m┃\x1b[0m
+\x1b[1m┡━━━━━━━━━━━━━━━━━╇━━━━━━━━━━━━━━━━━━━╇━━━━━━━━━┩\x1b[0m
+│ Agent Security  │ agent-sec-core-op │ enabled │
+│                 │ enclaw-plugin     │         │
+\x1b[1m└─────────────────┴───────────────────┴─────────┘\x1b[0m
+";
+        assert!(list_contains_plugin(
+            table,
+            "agent-sec-core-openclaw-plugin"
+        ));
+    }
+
+    #[test]
+    fn strip_ansi_removes_sgr_and_osc() {
+        assert_eq!(strip_ansi("\x1b[1mbold\x1b[0m"), "bold");
+        assert_eq!(strip_ansi("\x1b[32mgreen\x1b[0m text"), "green text");
+        assert_eq!(strip_ansi("no escapes here"), "no escapes here");
+    }
+
+    #[test]
+    fn is_border_line_identifies_borders() {
+        assert!(is_border_line("┏━━━━━━━━━━━━━━━━━┳━━━━━━━━━┓"));
+        assert!(is_border_line("├──────┼──────────┤"));
+        assert!(is_border_line("└──────┴──────────┘"));
+        assert!(!is_border_line("│ agent-sec │ enabled │"));
+        assert!(!is_border_line("plain text"));
+        assert!(!is_border_line(""));
+    }
+
+    #[test]
+    fn extract_cells_splits_data_line() {
+        let cells = extract_cells("│ agent-sec   │ enabled │").unwrap();
+        assert_eq!(cells, vec!["agent-sec", "enabled"]);
+    }
+
+    #[test]
+    fn extract_cells_returns_none_for_plain_text() {
+        assert!(extract_cells("plain text").is_none());
+    }
+
+    #[test]
+    fn list_contains_plugin_rich_table_name_and_id_both_wrap() {
+        let table = "\
+┏━━━━━━━━━━━━━━━━━┳━━━━━━━━━━━━━━━━━━━┳━━━━━━━━━┓
+┃ Name            ┃ ID                ┃ Status  ┃
+┡━━━━━━━━━━━━━━━━━╇━━━━━━━━━━━━━━━━━━━╇━━━━━━━━━┩
+│ Agent Security  │ agent-sec-core-op │ enabled │
+│ Core Plugin     │ enclaw-plugin     │         │
+└─────────────────┴───────────────────┴─────────┘
+";
+        assert!(list_contains_plugin(
+            table,
+            "agent-sec-core-openclaw-plugin"
+        ));
+        assert!(!list_contains_plugin(table, "agent-sec-core-op"));
+    }
+
+    #[test]
+    fn list_contains_plugin_no_false_positive_across_rows() {
+        let table = "\
+┏━━━━━━━━━━━━━━━━━┳━━━━━━━━━━━━━━━━━━━┳━━━━━━━━━┓
+┃ Name            ┃ ID                ┃ Status  ┃
+┡━━━━━━━━━━━━━━━━━╇━━━━━━━━━━━━━━━━━━━╇━━━━━━━━━┩
+│ Plugin A        │ agent-sec-core-op │ enabled │
+│ Plugin B        │ enclaw-plugin     │ enabled │
+└─────────────────┴───────────────────┴─────────┘
+";
+        assert!(
+            !list_contains_plugin(table, "agent-sec-core-openclaw-plugin"),
+            "must not merge IDs from independent rows into a false match"
+        );
+        assert!(list_contains_plugin(table, "agent-sec-core-op"));
+        assert!(list_contains_plugin(table, "enclaw-plugin"));
     }
 
     #[test]
@@ -771,7 +1247,7 @@ mod tests {
         .expect("write manifest");
 
         assert_eq!(
-            read_plugin_manifest_id(dir.path()).expect("read"),
+            read_plugin_manifest_id(dir.path(), "openclaw.plugin.json").expect("read"),
             Some("tokenless".to_string())
         );
     }
@@ -818,5 +1294,88 @@ mod tests {
         std::fs::write(dir.path().join("sub/b.txt"), b"WORLD").expect("rewrite");
         let d3 = digest_tree(dir.path()).expect("digest after change");
         assert_ne!(d1, d3, "digest must change when a file changes");
+    }
+
+    // -- config set cmd -------------------------------------------------
+
+    #[test]
+    fn config_set_cmd_string_value() {
+        let cmd = build_config_set_cmd(
+            "plugins.entries.sec.enabled",
+            &toml::Value::String("true".to_string()),
+            Path::new("/home/u/.openclaw"),
+            Some(Path::new("/home/u")),
+        );
+        assert_eq!(cmd.program, "openclaw");
+        assert_eq!(
+            cmd.args,
+            vec!["config", "set", "plugins.entries.sec.enabled", "true"]
+        );
+    }
+
+    #[test]
+    fn config_set_cmd_boolean_value() {
+        let cmd = build_config_set_cmd(
+            "debug.enabled",
+            &toml::Value::Boolean(true),
+            Path::new("/home/u/.openclaw"),
+            Some(Path::new("/home/u")),
+        );
+        assert_eq!(cmd.args, vec!["config", "set", "debug.enabled", "true"]);
+    }
+
+    #[test]
+    fn config_set_cmd_integer_value() {
+        let cmd = build_config_set_cmd(
+            "limits.max_plugins",
+            &toml::Value::Integer(42),
+            Path::new("/home/u/.openclaw"),
+            Some(Path::new("/home/u")),
+        );
+        assert_eq!(cmd.args, vec!["config", "set", "limits.max_plugins", "42"]);
+    }
+
+    #[test]
+    fn config_value_to_cli_string_covers_types() {
+        assert_eq!(
+            config_value_to_cli_string(&toml::Value::String("hello".into())),
+            "hello"
+        );
+        assert_eq!(config_value_to_cli_string(&toml::Value::Integer(7)), "7");
+        assert_eq!(config_value_to_cli_string(&toml::Value::Float(2.5)), "2.5");
+        assert_eq!(
+            config_value_to_cli_string(&toml::Value::Boolean(false)),
+            "false"
+        );
+    }
+
+    // -- claim_skill_resources / claim_config_count ---------------------
+
+    #[test]
+    fn claim_skill_resources_extracts_names() {
+        let claim = AdapterClaim {
+            claim_schema: CLAIM_SCHEMA_VERSION,
+            component: "test".to_string(),
+            framework: "openclaw".to_string(),
+            plugin_id: None,
+            enabled_at: "2026-01-01T00:00:00Z".to_string(),
+            resource_root: PathBuf::from("/tmp"),
+            bundle_digest: None,
+            driver_schema: DRIVER_SCHEMA_VERSION,
+            status: ClaimStatus::Enabled,
+            resources: Vec::new(),
+            driver_payload: DriverPayload::OpenClaw(OpenClawClaim {
+                state_dir_resource: "s".to_string(),
+                plugin_resource: "p".to_string(),
+                skill_resources: vec![
+                    "openclaw_skill_sec-audit".to_string(),
+                    "openclaw_skill_cred-scan".to_string(),
+                ],
+                config_resources: vec!["openclaw_config_0".to_string()],
+            }),
+        };
+        let skills = claim_skill_resources(&claim);
+        assert_eq!(skills, vec!["sec-audit", "cred-scan"]);
+        assert_eq!(claim_config_count(&claim), 1);
     }
 }

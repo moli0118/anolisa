@@ -798,6 +798,64 @@ tokenless stats show <record-id>  # Show before/after text for a record
 tokenless stats summary           # Aggregate savings across all operations
 ```
 
+#### Compression toggle and dry-run comparison (dual-run)
+
+Control whether compression is actually applied via `TOKENLESS_COMPRESSION_ENABLED` (or `compression_enabled` in `~/.tokenless/config.json`):
+
+- `1` (default): normal compression; the compressed output reaches the LLM context, recorded with `mode=active`.
+- `0` (**dry-run mode**): compression is computed and the predicted savings are recorded (`mode=dryrun`), but the **original text is emitted**, leaving the LLM context uncompressed.
+
+Run the same task twice (once with compression off, once on) to produce a comparison chart that accurately reflects tokenless savings:
+
+```bash
+# Run 1: compression off (dry-run baseline, emits original)
+TOKENLESS_COMPRESSION_ENABLED=0  <run the same task>   # recorded under session A
+# Run 2: compression on (real compression)
+TOKENLESS_COMPRESSION_ENABLED=1  <run the same task>   # recorded under session B
+
+# Comparison chart: baseline = context reached (raw), tokenless = compressed
+tokenless stats summary --compare <session-A> <session-B>
+tokenless stats summary --compare <session-A> <session-B> --json   # machine-readable
+```
+
+> Note: tokenless only measures the compressible content it processes; model reasoning tokens / real billed tokens are out of scope.
+
+#### SLS Log Recording (JSONL) {#sls-log-recording}
+
+In addition to SQLite stats, tokenless can append each compression as an **SLS (Simple Log Service) JSONL record** to a file, for ingestion by a log collector (e.g. ilogtail / SLS Logtail).
+
+> **File ownership**: the SLS JSONL file is owned and lifecycle-managed by the **anolisa SLS component** (it creates, rotates, and removes it). tokenless **does not manage the log file** — on each write it first checks whether the file exists, and **appends only if it exists, silently skipping otherwise** (treated as "SLS collection not ready"). tokenless never creates, truncates, or deletes the file or its directory.
+
+- **Enabled by default.** Toggle field: `sls_enabled` in `~/.tokenless/config.json` (default `true`); the `TOKENLESS_SLS_ENABLED` env var takes precedence — `1`/`true`/`yes` turns it on, anything else turns it off.
+- **Output path**: defaults to `/var/log/anolisa/sls/ops/tokenless.jsonl`, overridable via `TOKENLESS_SLS_PATH`. The path must live under `/var/log/` or `/tmp/` and must not contain `..`, otherwise it falls back to the default with a warning. Prefer `/var/log/` in production (`/tmp/` is world-writable).
+- **Recorded fields** (dot-namespaced keys matching the SLS ingestion schema):
+  - `component.name` / `component.version` / `component.agent_name` (agent identity, not user identity)
+  - `tokenless.operation` (e.g. `compress-schema` / `compress-response` / `compress-toon` / `rewrite-command`)
+  - `tokenless.session_id` / `tokenless.tool_use_id` / `tokenless.source_pid` (optional, omitted when empty)
+  - `tokenless.compression.{before,after}_{chars,tokens}`, `chars_saved`, `tokens_saved`, and both percentages
+
+  > Only metrics (char/token counts) are recorded — **no compressed payload** and no sensitive data; records carry no timestamp / hostname / user identity.
+
+```bash
+# Show current toggle state and source (default / config file / env override)
+tokenless stats status
+
+# Quick check: the file must first exist (created by the anolisa SLS component)
+# before tokenless will write to it.
+mkdir -p /tmp && touch /tmp/tokenless-sls.jsonl
+TOKENLESS_STATS_ENABLED=1 TOKENLESS_SLS_ENABLED=1 \
+TOKENLESS_SLS_PATH=/tmp/tokenless-sls.jsonl \
+tokenless compress-response -f resp.json
+tail -n1 /tmp/tokenless-sls.jsonl | jq .
+```
+
+**Disabling SLS**: set `TOKENLESS_SLS_ENABLED=0`, or `"sls_enabled": false` in `~/.tokenless/config.json`.
+
+**Production notes**:
+- tokenless does not create the log file or directory — the file must be pre-created by the anolisa SLS component; if it is absent, tokenless skips the write.
+- Log rotation is handled by the anolisa SLS component; tokenless does not touch the file lifecycle.
+- Writes are fail-silent (stderr-only warning, never affects the main flow).
+
 ### 6.3 Verify Installation
 
 ```bash
@@ -834,6 +892,7 @@ ls -la ~/.local/share/anolisa/adapters/tokenless/common/hooks/
 | JSON parse error | Validate JSON format with `jq . < settings.json` |
 | TOON encode fails | Ensure `toon` binary is in PATH; only JSON input is supported |
 | TOON stats not recorded | Verify `TOKENLESS_STATS_ENABLED` is not set to `0` or `false` |
+| SLS JSONL not generated | Verify `TOKENLESS_SLS_ENABLED` is not `0`/`false` (on by default); confirm `TOKENLESS_SLS_PATH` is under `/var/log/` or `/tmp/`; check stderr `tokenless-sls:` warnings; ensure the directory is writable |
 
 ### 7.2 OpenClaw Plugin
 
@@ -915,6 +974,8 @@ jq --version
 | Auto-fix script | `adapters/tokenless/common/tokenless-env-fix.sh` |
 | TOON codec (crates.io toon-format) | `toon-format` crate v0.4.6 |
 | Stats database (default) | `~/.tokenless/stats.db` |
+| Config file (stats/SLS/compression toggles) | `~/.tokenless/config.json` |
+| SLS JSONL output (default) | `/var/log/anolisa/sls/ops/tokenless.jsonl` |
 | Integration tests | `crates/tokenless-schema/tests/integration_test.rs` |
 | TOON E2E tests | `tests/test-toon-full.sh` |
 | Full test suite | `tests/run-all-tests.sh` |
@@ -949,5 +1010,5 @@ All integration paths use **fail-open** strategy:
 ---
 
 **License**: MIT
-**Document Version**: 1.2
-**Last Updated**: 2026-04-25
+**Document Version**: 1.3
+**Last Updated**: 2026-06-24

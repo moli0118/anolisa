@@ -6,7 +6,7 @@
  * {@link CommandExecutor} and maintaining a local {@link SnapshotStore} cache.
  */
 
-import { CommandExecutor } from "./commands.js";
+import { CommandExecutor, extractTiming } from "./commands.js";
 import { SnapshotStore } from "./snapshot-store.js";
 import type {
   CheckpointResult,
@@ -182,8 +182,8 @@ export class BtrfsManager {
         };
       }
 
-      // Check for skipped checkpoint (empty workspace)
-      if (output.stdout && (output.stdout.includes('Skipped') || output.stdout.includes('Empty workspace'))) {
+      // The CLI reports CheckpointSkipped on stderr while keeping exit code 0.
+      if (`${output.stdout}\n${output.stderr}`.includes("Empty workspace, no snapshot created.")) {
         return { success: true, skipped: true, reason: 'Empty workspace, no snapshot created.', message: 'Empty workspace, no snapshot created.' };
       }
 
@@ -207,7 +207,7 @@ export class BtrfsManager {
       return {
         success: true,
         snapshot: snapshotId,
-        message: `Checkpoint created: ${snapshotId}`,
+        message: `Checkpoint created: ${snapshotId}${extractTiming(output.stdout)}`,
       };
     } catch (error) {
       const msg = error instanceof Error ? error.message : String(error);
@@ -216,24 +216,44 @@ export class BtrfsManager {
   }
 
   /**
-   * Roll back the workspace to a specified checkpoint.
+   * Roll back the workspace to a specified checkpoint or N ancestors back.
    *
-   * @param target - Snapshot identifier (e.g. "msg1-step2") or name.
+   * @param target       - Snapshot identifier (mutually exclusive with numAncestors).
+   * @param numAncestors - Number of ancestors to traverse (mutually exclusive with target).
+   * @param preview      - Show changes without executing the rollback.
    * @returns A {@link RollbackResult} describing the outcome.
    */
-  public async rollback(target: string): Promise<RollbackResult> {
+  public async rollback(
+    target?: string,
+    numAncestors?: number,
+    preview: boolean = false,
+  ): Promise<RollbackResult> {
     if (!this.workspacePath) {
       return { success: false, message: "Workspace not initialized" };
     }
 
+    const label = target || `ancestors=${numAncestors}`;
     try {
-      const output = await this.executor.rollback(this.workspacePath, target);
+      const output = await this.executor.rollback(
+        this.workspacePath,
+        target,
+        numAncestors,
+        preview,
+      );
 
       if (output.exitCode !== 0) {
         return {
           success: false,
           target,
-          message: mapErrorToLLMMessage(output.stderr, { id: target }),
+          message: mapErrorToLLMMessage(output.stderr, { id: label }),
+        };
+      }
+
+      if (preview) {
+        return {
+          success: true,
+          target,
+          message: output.stdout.replace(/\x1b\[[0-9;]*m/g, "").trim(),
         };
       }
 
@@ -246,11 +266,8 @@ export class BtrfsManager {
         }
       } catch { /* ignore refresh errors */ }
 
-      return {
-        success: true,
-        target,
-        message: `Rolled back to ${target}`,
-      };
+      const desc = target ? `Rolled back to ${target}` : `Rolled back ${numAncestors} ancestor(s)`;
+      return { success: true, target, message: `${desc}${extractTiming(output.stdout)}` };
     } catch (error) {
       const msg = error instanceof Error ? error.message : String(error);
       return { success: false, target, message: `Rollback error: ${msg}` };
@@ -293,7 +310,7 @@ export class BtrfsManager {
   /**
    * Execute diff and return the raw CLI output without parsing.
    */
-  public async execDiffRaw(from: string, to: string): Promise<{ success: boolean; text: string }> {
+  public async execDiffRaw(from: string, to?: string): Promise<{ success: boolean; text: string }> {
     if (!this.workspacePath) {
       return { success: false, text: "Workspace not initialized" };
     }
@@ -303,7 +320,8 @@ export class BtrfsManager {
         return { success: false, text: mapErrorToLLMMessage(output.stderr) };
       }
       const stdout = output.stdout.replace(/\x1b\[[0-9;]*m/g, '').trim();
-      return { success: true, text: stdout || `No changes between ${from} and ${to}.` };
+      const target = to ?? "current workspace";
+      return { success: true, text: stdout || `No changes between ${from} and ${target}.` };
     } catch (error) {
       const msg = error instanceof Error ? error.message : String(error);
       return { success: false, text: `Diff error: ${msg}` };

@@ -5,11 +5,13 @@
  * They access shared state via the pluginState singleton.
  */
 
-import { CommandExecutor } from "./commands.js";
+import { CommandExecutor, extractTiming } from "./commands.js";
 import { mapErrorToLLMMessage } from "./btrfs-manager.js";
 import type { AgentToolResult } from "../types-shim.js";
 import { pluginState, UNAVAILABLE_MSG, cwdInsideWorkspace, cwdInsideWorkspaceReason } from "./state.js";
 import { parseWorkspaceCleanupJson } from "./config.js";
+import { persistConfig } from "./persist.js";
+import { CrontabManager, parseSchedulesUpdate } from "./cron.js";
 
 // ---------------------------------------------------------------------------
 // Helpers
@@ -57,10 +59,11 @@ export async function handleCheckpoint(
       if (output.exitCode !== 0) {
         return { text: mapErrorToLLMMessage(output.stderr, { id }), isError: true };
       }
-      if (output.stdout && (output.stdout.includes('Skipped') || output.stdout.includes('Empty workspace'))) {
+      const timing = extractTiming(output.stdout);
+      if (`${output.stdout}\n${output.stderr}`.includes("Empty workspace, no snapshot created.")) {
         return { text: 'Empty workspace, no snapshot created.', isError: false };
       }
-      return { text: `Checkpoint created: ${id}`, isError: false };
+      return { text: `Checkpoint created: ${id}${timing}`, isError: false };
     } catch (error) {
       const msg = error instanceof Error ? error.message : String(error);
       return { text: `Checkpoint error: ${msg}`, isError: true };
@@ -88,47 +91,73 @@ export async function handleCheckpoint(
 export async function handleRollback(
   target?: string,
   workspace?: string,
+  numAncestors?: number,
+  preview: boolean = false,
 ): Promise<{ text: string; isError: boolean }> {
   if (!pluginState.manager || !pluginState.environmentReady) {
     return { text: UNAVAILABLE_MSG, isError: true };
   }
   const trimmed = target?.trim();
-  if (!trimmed) {
+
+  if (trimmed && numAncestors !== undefined) {
+    return { text: "'target' and 'numAncestors' are mutually exclusive", isError: true };
+  }
+  if (!trimmed && numAncestors === undefined) {
     return {
-      text: "Usage: ws-ckpt-rollback <target>\n  target: snapshot hash id",
+      text: "Either 'target' or 'numAncestors' is required.\n  target: snapshot id\n  numAncestors: number of ancestors to traverse (>=1)",
       isError: true,
     };
   }
+  if (numAncestors !== undefined && (!Number.isFinite(numAncestors) || numAncestors < 1)) {
+    return { text: "'numAncestors' must be >= 1", isError: true };
+  }
 
-  const explicitWs = workspace?.trim();
-  if (explicitWs) {
-    const cwdCheck = cwdInsideWorkspace(explicitWs);
+  const resolvedWs = workspace?.trim() || pluginState.resolvedConfig?.workspace;
+  if (!resolvedWs) {
+    return { text: "No workspace configured", isError: true };
+  }
+
+  if (!preview) {
+    const cwdCheck = cwdInsideWorkspace(resolvedWs);
     if (cwdCheck.inside) {
-      return { text: cwdInsideWorkspaceReason(cwdCheck.cwd, explicitWs), isError: true };
-    }
-    try {
-      const executor = new CommandExecutor();
-      const output = await executor.rollback(explicitWs, trimmed);
-      if (output.exitCode !== 0) {
-        return { text: mapErrorToLLMMessage(output.stderr, { id: trimmed }), isError: true };
-      }
-      return { text: `Rolled back to ${trimmed}`, isError: false };
-    } catch (error) {
-      const msg = error instanceof Error ? error.message : String(error);
-      return { text: `Rollback error: ${msg}`, isError: true };
+      return { text: cwdInsideWorkspaceReason(cwdCheck.cwd, resolvedWs), isError: true };
     }
   }
 
-  const ws = pluginState.resolvedConfig?.workspace;
-  if (ws) {
-    const cwdCheck = cwdInsideWorkspace(ws);
-    if (cwdCheck.inside) {
-      return { text: cwdInsideWorkspaceReason(cwdCheck.cwd, ws), isError: true };
-    }
+  if (workspace?.trim()) {
+    return runRollbackViaExecutor(resolvedWs, trimmed || undefined, numAncestors, preview);
   }
 
-  const result = await pluginState.manager.rollback(trimmed);
+  const result = await pluginState.manager.rollback(trimmed || undefined, numAncestors, preview);
   return { text: result.message, isError: !result.success };
+}
+
+async function runRollbackViaExecutor(
+  ws: string,
+  target?: string,
+  numAncestors?: number,
+  preview: boolean = false,
+): Promise<{ text: string; isError: boolean }> {
+  try {
+    const executor = new CommandExecutor();
+    const output = await executor.rollback(ws, target, numAncestors, preview);
+    if (output.exitCode !== 0) {
+      const label = target || `ancestors=${numAncestors}`;
+      return { text: mapErrorToLLMMessage(output.stderr, { id: label }), isError: true };
+    }
+    if (preview) {
+      return {
+        text: output.stdout.replace(/\x1b\[[0-9;]*m/g, "").trim(),
+        isError: false,
+      };
+    }
+    const timing = extractTiming(output.stdout);
+    const desc = target ? `Rolled back to ${target}` : `Rolled back ${numAncestors} ancestor(s)`;
+    return { text: `${desc}${timing}`, isError: false };
+  } catch (error) {
+    const msg = error instanceof Error ? error.message : String(error);
+    return { text: `Rollback error: ${msg}`, isError: true };
+  }
 }
 
 export async function handleListCheckpoints(): Promise<{
@@ -191,7 +220,7 @@ export async function handleDelete(
       return { text: mapErrorToLLMMessage(output.stderr, { id: snapshot }), isError: true };
     }
     pluginState.manager.getStore().remove(snapshot);
-    return { text: `Snapshot ${snapshot} deleted`, isError: false };
+    return { text: `Snapshot ${snapshot} deleted${extractTiming(output.stdout)}`, isError: false };
   } catch (error) {
     const msg = error instanceof Error ? error.message : String(error);
     return { text: `Delete error: ${msg}`, isError: true };
@@ -211,7 +240,7 @@ export async function handleDiff(
       isError: true,
     };
   }
-  const result = await pluginState.manager.execDiffRaw(fromArg, toArg ?? "HEAD");
+  const result = await pluginState.manager.execDiffRaw(fromArg, toArg);
   return { text: result.text, isError: !result.success };
 }
 
@@ -279,6 +308,13 @@ export async function handleConfig(
         break;
     }
     lines.push(`  workspace: ${cfg.workspace}`);
+    const schedules = cfg.cronSchedules ?? [];
+    if (schedules.length > 0) {
+      lines.push("  cronSchedules:");
+      for (const expr of schedules) lines.push(`    - ${expr}`);
+    } else {
+      lines.push("  cronSchedules:  (disabled)");
+    }
     lines.push("\nNote: maxSnapshotsNum / maxSnapshotsDuration are this workspace's effective auto-cleanup policy (per-ws override on top of the daemon default).");
     if (parsed.kind === "parse-error") {
       lines.push(`\n(daemon response did not match expected schema: ${parsed.reason})`);
@@ -289,7 +325,7 @@ export async function handleConfig(
   if (act === "update" || act === "set") {
     if (!key) {
       return {
-        text: "Usage: ws-ckpt-config update <key> <value>\n  Available keys: autoCheckpoint, maxSnapshotsNum, maxSnapshotsDuration, workspace",
+        text: "Usage: ws-ckpt-config update <key> <value>\n  Available keys: autoCheckpoint, cronSchedules, maxSnapshotsNum, maxSnapshotsDuration, workspace",
         isError: true,
       };
     }
@@ -379,11 +415,12 @@ export async function handleConfig(
         }
       }
       pluginState.resolvedConfig.autoCheckpoint = coerced;
-      const persistHint = coerced
-        ? `\n\nNote: This change is in-memory only and will reset on Gateway restart.\nTo persist, run:\n  openclaw config set plugins.entries.ws-ckpt.config.autoCheckpoint true --strict-json\n(This will cause a Gateway restart.)`
-        : `\n\nNote: This change is in-memory only and will reset on Gateway restart.\nTo persist, run:\n  openclaw config set plugins.entries.ws-ckpt.config.autoCheckpoint false --strict-json\n(This will cause a Gateway restart.)`;
+      const persistErr = persistConfig({ autoCheckpoint: coerced });
+      const persistNote = persistErr
+        ? `\n\nWARNING: Failed to persist config: ${persistErr}. Change is in-memory only.`
+        : "";
       return {
-        text: `Config updated: autoCheckpoint = ${coerced}${persistHint}`,
+        text: `Config updated: autoCheckpoint = ${coerced}${persistNote}`,
         isError: false,
       };
     }
@@ -392,15 +429,51 @@ export async function handleConfig(
       if (!value) {
         return { text: "workspace requires a path value", isError: true };
       }
+      const oldWs = pluginState.resolvedConfig.workspace;
       pluginState.resolvedConfig.workspace = value;
+      const schedules = pluginState.resolvedConfig.cronSchedules ?? [];
+      const warnings = await CrontabManager.migrate(oldWs, value, schedules);
+      const persistErr = persistConfig({ workspace: value });
+      let msg = `Config updated: workspace = ${value}`;
+      if (persistErr) msg += `\n\nWARNING: Failed to persist config: ${persistErr}. Change is in-memory only.`;
+      if (warnings.length > 0) msg += "\n\n" + warnings.join("\n");
+      return { text: msg, isError: false };
+    }
+
+    if (key === "cronSchedules") {
+      if (value === undefined) {
+        return {
+          text: 'cronSchedules requires a value. Use: add "EXPR", remove "EXPR", or set \'["EXPR"]\'',
+          isError: true,
+        };
+      }
+      const ws = pluginState.resolvedConfig.workspace;
+      if (!ws) {
+        return { text: "No workspace configured", isError: true };
+      }
+      const current = [...(pluginState.resolvedConfig.cronSchedules ?? [])];
+      const parsed = parseSchedulesUpdate(value, current);
+      if ("error" in parsed) {
+        return { text: parsed.error, isError: true };
+      }
+      pluginState.resolvedConfig.cronSchedules = parsed.schedules;
+      const persistErr = persistConfig({ cronSchedules: parsed.schedules });
+      let warnings = "";
+      if (persistErr) {
+        warnings += `\n\nWARNING: Failed to persist config: ${persistErr}. Change is in-memory only.`;
+      }
+      if (!(await CrontabManager.syncWithRetry(ws, parsed.schedules))) {
+        warnings += "\n\nWARNING: Failed to sync crontab after 3 attempts. " +
+          "Config saved but cron snapshots will not run until next session start or manual retry.";
+      }
       return {
-        text: `Config updated: workspace = ${value} (in-memory, will reset on Gateway restart)`,
+        text: `cronSchedules updated: ${parsed.schedules.length > 0 ? JSON.stringify(parsed.schedules) : "(disabled)"}` + warnings,
         isError: false,
       };
     }
 
     return {
-      text: `Unknown config key: ${key}. Available: autoCheckpoint, maxSnapshotsNum, maxSnapshotsDuration, workspace`,
+      text: `Unknown config key: ${key}. Available: autoCheckpoint, cronSchedules, maxSnapshotsNum, maxSnapshotsDuration, workspace`,
       isError: true,
     };
   }

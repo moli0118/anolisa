@@ -4,7 +4,7 @@ on:
   workflow_call:
     inputs:
       component:
-        description: "Component to build (copilot-shell, agent-sec-core, agentsight, os-skills, tokenless, ws-ckpt, agent-memory)"
+        description: "Component to build (copilot-shell, agent-sec-core, agentsight, os-skills, tokenless, ws-ckpt, agent-memory, skillfs)"
         required: true
         type: string
       version:
@@ -33,7 +33,7 @@ on:
 jobs:
   build-rpm:
     name: "Build"
-    runs-on: [self-hosted, Linux, "${{ inputs.arch == 'arm64' && 'ARM64' || 'X64' }}", "${{ inputs.arch == 'arm64' && 'ubuntu-any' || 'ubuntu' }}"]
+    runs-on: ${{ inputs.arch == 'arm64' && 'ubuntu-24.04-arm' || 'ubuntu-22.04' }}
     container:
       image: alibaba-cloud-linux-4-registry.cn-hangzhou.cr.aliyuncs.com/alinux4/alinux4:latest
     steps:
@@ -68,6 +68,9 @@ jobs:
               # journald fan-out feature.
               dnf install -y rust cargo cmake systemd-devel
               ;;
+            skillfs)
+              dnf install -y rust cargo gcc make pkgconfig fuse3-devel
+              ;;
             os-skills)
               # noarch, no extra build deps
               ;;
@@ -80,6 +83,12 @@ jobs:
         uses: dtolnay/rust-toolchain@stable
         with:
           toolchain: '1.93.0'
+
+      - name: "Setup Rust toolchain (skillfs)"
+        if: inputs.component == 'skillfs'
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: '1.86.0'
 
       - name: "Setup Python + uv (agent-sec-core)"
         if: inputs.component == 'agent-sec-core'

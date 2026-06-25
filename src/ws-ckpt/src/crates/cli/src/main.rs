@@ -17,9 +17,25 @@ use ws_ckpt_common::{
     GLOBAL_CONFIG_JSON_SCHEMA, MAX_FRAME_SIZE, OVERVIEW_JSON_SCHEMA,
 };
 
+use std::cell::RefCell;
+
 /// Backend-usage advisory threshold (percent); CLI-side since daemon returns raw bytes.
 const ADVISORY_FS_USAGE_PCT: f64 = 90.0;
 const ADVISORY_TIMEOUT: std::time::Duration = std::time::Duration::from_millis(30);
+
+// JSON output buffer: handlers stage their payload here so main() can wrap
+// it with `elapsed_secs` and emit a single JSON object on stdout.
+thread_local! {
+    static JSON_OUTPUT: RefCell<Option<serde_json::Value>> = const { RefCell::new(None) };
+}
+
+fn emit_json(value: serde_json::Value) {
+    JSON_OUTPUT.with(|buf| *buf.borrow_mut() = Some(value));
+}
+
+fn take_json_output() -> Option<serde_json::Value> {
+    JSON_OUTPUT.with(|buf| buf.borrow_mut().take())
+}
 
 // Parse CLI value for `--auto-cleanup-keep`: integer -> Count mode, duration
 // string (e.g. "30d", units s/m/h/d/w) -> Age mode. Mirrors TOML semantics in
@@ -131,9 +147,12 @@ enum Commands {
         #[arg(long, short = 'w', value_parser = workspace_value_parser())]
         workspace: String,
 
-        /// Snapshot ID (must be unique within the workspace)
-        #[arg(long, short = 'i', value_parser = snapshot_id_value_parser())]
-        id: String,
+        /// Snapshot ID (auto-generated if omitted)
+        #[arg(long = "snapshot", short = 's', conflicts_with = "legacy_id", value_parser = snapshot_id_value_parser())]
+        snapshot: Option<String>,
+
+        #[arg(long = "id", short = 'i', hide = true, value_parser = snapshot_id_value_parser())]
+        legacy_id: Option<String>,
 
         /// Commit message describing the checkpoint
         #[arg(long, short = 'm')]
@@ -150,9 +169,17 @@ enum Commands {
         #[arg(long, short = 'w', value_parser = workspace_value_parser())]
         workspace: String,
 
-        /// Target snapshot (ID like msg1-step2, or name like before-refactor)
-        #[arg(long = "snapshot", short = 's', value_parser = snapshot_id_value_parser())]
-        to: String,
+        /// Target snapshot (ID or prefix) — mutually exclusive with -n
+        #[arg(long = "snapshot", short = 's', conflicts_with = "num_ancestors", value_parser = snapshot_id_value_parser())]
+        to: Option<String>,
+
+        /// Roll back N ancestors along parent chain — mutually exclusive with -s
+        #[arg(long = "num-ancestors", short = 'n', conflicts_with = "to", value_parser = clap::value_parser!(u32).range(1..))]
+        num_ancestors: Option<u32>,
+
+        /// Preview file changes without executing rollback
+        #[arg(long)]
+        preview: bool,
     },
 
     /// Delete a specific snapshot
@@ -181,7 +208,7 @@ enum Commands {
         format: String,
     },
 
-    /// Show diff between two snapshots
+    /// Show diff between two snapshots, or between a snapshot and the current workspace
     Diff {
         /// Workspace path or ID (absolute path, relative path, or workspace ID)
         #[arg(long, short = 'w', value_parser = workspace_value_parser())]
@@ -191,9 +218,9 @@ enum Commands {
         #[arg(long, short = 'f', value_parser = snapshot_id_value_parser())]
         from: String,
 
-        /// Target snapshot (ID or name)
+        /// Target snapshot (ID or name); omit to diff against current workspace
         #[arg(long, short = 't', value_parser = snapshot_id_value_parser())]
-        to: String,
+        to: Option<String>,
     },
 
     /// Show daemon and workspace status
@@ -249,14 +276,41 @@ enum Commands {
 #[tokio::main]
 async fn main() {
     let cli = Cli::parse();
+    let is_daemon = matches!(cli.command, Commands::Daemon { .. });
+    let start = std::time::Instant::now();
 
     match run(cli).await {
         Ok(()) => {
+            if !is_daemon {
+                let elapsed = start.elapsed().as_secs_f64();
+                // JSON mode: inject timing into buffered output; text mode: stderr.
+                if let Some(mut data) = take_json_output() {
+                    if let serde_json::Value::Object(map) = &mut data {
+                        map.insert("elapsed_secs".to_string(), serde_json::json!(elapsed));
+                    }
+                    println!("{}", serde_json::to_string_pretty(&data).unwrap());
+                } else {
+                    println!("Completed in {:.3}s", elapsed);
+                }
+            }
             // Post-command soft advisory: best-effort, silent on failure.
             print_health_advisory_if_needed().await;
         }
         Err(e) => {
-            eprintln!("\x1b[31mError: {:#}\x1b[0m", e);
+            let elapsed = start.elapsed().as_secs_f64();
+            if let Some(mut data) = take_json_output() {
+                if let serde_json::Value::Object(map) = &mut data {
+                    map.insert("elapsed_secs".to_string(), serde_json::json!(elapsed));
+                    map.insert("error".to_string(), serde_json::json!(format!("{:#}", e)));
+                }
+                // Errors go to stderr so stdout stays clean for pipes.
+                eprintln!("{}", serde_json::to_string_pretty(&data).unwrap());
+            } else if !is_daemon {
+                eprintln!("Failed after {:.3}s", elapsed);
+            }
+            if !is_daemon {
+                eprintln!("\x1b[31mError: {:#}\x1b[0m", e);
+            }
             process::exit(1);
         }
     }
@@ -320,10 +374,19 @@ async fn run(cli: Cli) -> Result<()> {
         }
         Commands::Checkpoint {
             workspace,
-            id,
+            snapshot,
+            legacy_id,
             message,
             metadata,
         } => {
+            let id = match (snapshot, legacy_id) {
+                (_, Some(legacy)) => {
+                    eprintln!("Warning: --id/-i is deprecated, use --snapshot/-s instead");
+                    legacy
+                }
+                (Some(s), _) => s,
+                (None, None) => generate_auto_id(),
+            };
             // Validate metadata is valid JSON if provided
             if let Some(ref s) = metadata {
                 serde_json::from_str::<serde_json::Value>(s)
@@ -339,13 +402,32 @@ async fn run(cli: Cli) -> Result<()> {
             let response = send_request_to_daemon(&request).await?;
             handle_response(response, &request).await?;
         }
-        Commands::Rollback { workspace, to } => {
-            let request = Request::Rollback {
-                workspace: resolve_workspace_arg(&workspace),
-                to,
-            };
-            let response = send_request_to_daemon(&request).await?;
-            handle_response(response, &request).await?;
+        Commands::Rollback {
+            workspace,
+            to,
+            num_ancestors,
+            preview,
+        } => {
+            if to.is_none() && num_ancestors.is_none() {
+                anyhow::bail!("either --snapshot/-s or --num-ancestors/-n must be specified");
+            }
+            if preview {
+                let request = Request::RollbackPreview {
+                    workspace: resolve_workspace_arg(&workspace),
+                    to,
+                    num_ancestors,
+                };
+                let response = send_request_to_daemon(&request).await?;
+                handle_rollback_preview_response(response)?;
+            } else {
+                let request = Request::Rollback {
+                    workspace: resolve_workspace_arg(&workspace),
+                    to,
+                    num_ancestors,
+                };
+                let response = send_request_to_daemon(&request).await?;
+                handle_response(response, &request).await?;
+            }
         }
         Commands::Delete {
             workspace,
@@ -378,6 +460,7 @@ async fn run(cli: Cli) -> Result<()> {
                 from,
                 to,
             };
+
             let response = send_request_to_daemon(&request).await?;
             handle_diff_response(response)?;
         }
@@ -444,6 +527,12 @@ fn snapshot_id_value_parser() -> impl TypedValueParser<Value = String> {
         }
         Ok(s)
     })
+}
+
+fn generate_auto_id() -> String {
+    chrono::Utc::now()
+        .format("ckpt-%Y%m%dT%H%M%S%.3f")
+        .to_string()
 }
 
 /// Resolve workspace identifier: convert filesystem paths to absolute,
@@ -780,7 +869,7 @@ fn handle_list_response(response: Response, format: &str) -> Result<()> {
     match response {
         Response::ListOk { snapshots } => {
             if format == "json" {
-                println!("{}", serde_json::to_string_pretty(&snapshots)?);
+                emit_json(serde_json::to_value(&snapshots)?);
             } else {
                 // Table format
                 if snapshots.is_empty() {
@@ -864,25 +953,7 @@ fn handle_list_response(response: Response, format: &str) -> Result<()> {
 fn handle_diff_response(response: Response) -> Result<()> {
     match response {
         Response::DiffOk { changes } => {
-            if changes.is_empty() {
-                println!("No differences found.");
-            } else {
-                for entry in &changes {
-                    let marker = match entry.change_type {
-                        ChangeType::Added => "\x1b[32m+",
-                        ChangeType::Deleted => "\x1b[31m-",
-                        ChangeType::Modified => "\x1b[33mM",
-                        ChangeType::Renamed => "\x1b[36mR",
-                    };
-                    let detail = entry
-                        .detail
-                        .as_deref()
-                        .map(|d| format!(" ({})", d))
-                        .unwrap_or_default();
-                    println!("{}  {}{}\x1b[0m", marker, entry.path, detail);
-                }
-                println!("\n{} change(s)", changes.len());
-            }
+            print_diff_entries(&changes);
         }
         Response::Error { code, message } => {
             eprintln!("\x1b[31mError [{:?}]: {}\x1b[0m", code, message);
@@ -895,12 +966,55 @@ fn handle_diff_response(response: Response) -> Result<()> {
     Ok(())
 }
 
+/// Handle RollbackPreviewOk response, formatting the rollback diff summary.
+fn handle_rollback_preview_response(response: Response) -> Result<()> {
+    match response {
+        Response::RollbackPreviewOk { to, changes } => {
+            println!("\x1b[1mRollback preview (no changes applied)\x1b[0m");
+            println!("Target snapshot: {}\n", to);
+            println!("Changes since target snapshot (rollback will revert these):");
+            print_diff_entries(&changes);
+        }
+        Response::Error { code, message } => {
+            eprintln!("\x1b[31mError [{:?}]: {}\x1b[0m", code, message);
+            process::exit(1);
+        }
+        _ => {
+            eprintln!("\x1b[33mUnexpected response type\x1b[0m");
+        }
+    }
+    Ok(())
+}
+
+fn print_diff_entries(changes: &[ws_ckpt_common::DiffEntry]) {
+    if changes.is_empty() {
+        println!("No differences found.");
+        return;
+    }
+
+    for entry in changes {
+        let marker = match entry.change_type {
+            ChangeType::Added => "\x1b[32m+",
+            ChangeType::Deleted => "\x1b[31m-",
+            ChangeType::Modified => "\x1b[33mM",
+            ChangeType::Renamed => "\x1b[36mR",
+        };
+        let detail = entry
+            .detail
+            .as_deref()
+            .map(|d| format!(" ({})", d))
+            .unwrap_or_default();
+        println!("{}  {}{}\x1b[0m", marker, entry.path, detail);
+    }
+    println!("\n{} change(s)", changes.len());
+}
+
 /// Handle StatusOk response, formatting the status report.
 fn handle_status_response(response: Response, format: &str) -> Result<()> {
     match response {
         Response::StatusOk { report } => {
             if format == "json" {
-                println!("{}", serde_json::to_string_pretty(&report)?);
+                emit_json(serde_json::to_value(&report)?);
             } else {
                 println!("\x1b[1mDaemon Status\x1b[0m");
                 println!("  Uptime: {} seconds", report.uptime_secs);
@@ -1221,7 +1335,7 @@ fn print_workspace_policy_response_formatted(resp: Response, format: OutputForma
             }
             OutputFormat::Json => {
                 let json = WorkspacePolicyJson::from_views(ws_id, &effective, &local, &global);
-                println!("{}", serde_json::to_string_pretty(&json)?);
+                emit_json(serde_json::to_value(&json)?);
                 Ok(())
             }
         },
@@ -1273,7 +1387,7 @@ async fn handle_global_config_view(format: OutputFormat) -> Result<()> {
             img_size_gb: img_size,
             img_max_percent: img_max,
         };
-        println!("{}", serde_json::to_string_pretty(&json)?);
+        emit_json(serde_json::to_value(&json)?);
         return Ok(());
     }
 
@@ -1377,7 +1491,7 @@ async fn handle_config_overview_view(format: OutputFormat) -> Result<()> {
                 "inherit_global": inherit,
             },
         });
-        println!("{}", serde_json::to_string_pretty(&json)?);
+        emit_json(json);
         return Ok(());
     }
 
@@ -1516,7 +1630,7 @@ async fn handle_global_config_update(
         match reloaded_config {
             Some(cr) => {
                 let json = config_report_to_global_json(&cr);
-                println!("{}", serde_json::to_string_pretty(&json)?);
+                emit_json(serde_json::to_value(&json)?);
             }
             None => handle_global_config_view(format).await?,
         }
@@ -1742,7 +1856,7 @@ mod tests {
         // subcommands. Tested independently for each blank value.
         let trailing: &[(&str, &[&str])] = &[
             ("init", &[]),
-            ("checkpoint", &["-i", "snap-1"]),
+            ("checkpoint", &["-s", "snap-1"]),
             ("rollback", &["-s", "snap-1"]),
             ("delete", &["-s", "snap-1"]),
             ("list", &[]),
@@ -1798,7 +1912,7 @@ mod tests {
             "checkpoint",
             "--workspace",
             "/tmp/test",
-            "--id",
+            "--snapshot",
             "msg1-step0",
             "-m",
             "save point",
@@ -1809,12 +1923,13 @@ mod tests {
         match cli.command {
             Commands::Checkpoint {
                 workspace,
-                id,
+                snapshot,
                 message,
                 metadata,
+                ..
             } => {
                 assert_eq!(workspace, "/tmp/test");
-                assert_eq!(id, "msg1-step0");
+                assert_eq!(snapshot.as_deref(), Some("msg1-step0"));
                 assert_eq!(message.as_deref(), Some("save point"));
                 assert_eq!(metadata.as_deref(), Some(r#"{"key":"value"}"#));
             }
@@ -1829,18 +1944,18 @@ mod tests {
             "checkpoint",
             "--workspace",
             "/ws",
-            "--id",
+            "--snapshot",
             "snap-1",
         ])
         .unwrap();
         match cli.command {
             Commands::Checkpoint {
-                id,
+                snapshot,
                 message,
                 metadata,
                 ..
             } => {
-                assert_eq!(id, "snap-1");
+                assert_eq!(snapshot.as_deref(), Some("snap-1"));
                 assert!(message.is_none());
                 assert!(metadata.is_none());
             }
@@ -1855,7 +1970,7 @@ mod tests {
             "checkpoint",
             "--workspace",
             "/ws",
-            "--id",
+            "--snapshot",
             "snap-1",
             "-m",
             "备注",
@@ -1872,7 +1987,7 @@ mod tests {
     #[test]
     fn parse_rejects_empty_or_whitespace_checkpoint_id() {
         for blank in ["", " ", "   ", "\t"] {
-            let err = Cli::try_parse_from(["ws-ckpt", "checkpoint", "-w", "/ws", "-i", blank])
+            let err = Cli::try_parse_from(["ws-ckpt", "checkpoint", "-w", "/ws", "-s", blank])
                 .err()
                 .unwrap_or_else(|| panic!("expected parse error for id {:?}", blank));
             assert_eq!(
@@ -1888,7 +2003,7 @@ mod tests {
     #[test]
     fn parse_rejects_checkpoint_id_with_path_separators() {
         for bad in ["foo/bar", "..", ".", "a\\b", "/abs"] {
-            let err = Cli::try_parse_from(["ws-ckpt", "checkpoint", "-w", "/ws", "-i", bad])
+            let err = Cli::try_parse_from(["ws-ckpt", "checkpoint", "-w", "/ws", "-s", bad])
                 .err()
                 .unwrap_or_else(|| panic!("expected parse error for id {:?}", bad));
             assert_eq!(
@@ -1904,9 +2019,89 @@ mod tests {
     #[test]
     fn parse_accepts_reasonable_checkpoint_ids() {
         for good in ["snap-1", "msg1-step2", "before-refactor", "v1.2.3"] {
-            Cli::try_parse_from(["ws-ckpt", "checkpoint", "-w", "/ws", "-i", good])
+            Cli::try_parse_from(["ws-ckpt", "checkpoint", "-w", "/ws", "-s", good])
                 .unwrap_or_else(|_| panic!("expected acceptance for id {:?}", good));
         }
+    }
+
+    #[test]
+    fn parse_checkpoint_accepts_snapshot_and_legacy_id_flags() {
+        // Primary: --snapshot / -s → snapshot field
+        let cli =
+            Cli::try_parse_from(["ws-ckpt", "checkpoint", "-w", "/ws", "--snapshot", "snap-1"])
+                .unwrap();
+        match &cli.command {
+            Commands::Checkpoint {
+                snapshot,
+                legacy_id,
+                ..
+            } => {
+                assert_eq!(snapshot.as_deref(), Some("snap-1"));
+                assert!(legacy_id.is_none());
+            }
+            _ => panic!("expected Checkpoint"),
+        }
+
+        let cli =
+            Cli::try_parse_from(["ws-ckpt", "checkpoint", "-w", "/ws", "-s", "snap-2"]).unwrap();
+        match &cli.command {
+            Commands::Checkpoint {
+                snapshot,
+                legacy_id,
+                ..
+            } => {
+                assert_eq!(snapshot.as_deref(), Some("snap-2"));
+                assert!(legacy_id.is_none());
+            }
+            _ => panic!("expected Checkpoint"),
+        }
+
+        // Legacy alias: --id / -i → legacy_id field (still parses correctly).
+        let cli =
+            Cli::try_parse_from(["ws-ckpt", "checkpoint", "-w", "/ws", "--id", "snap-3"]).unwrap();
+        match &cli.command {
+            Commands::Checkpoint {
+                snapshot,
+                legacy_id,
+                ..
+            } => {
+                assert!(snapshot.is_none());
+                assert_eq!(legacy_id.as_deref(), Some("snap-3"));
+            }
+            _ => panic!("expected Checkpoint"),
+        }
+
+        let cli =
+            Cli::try_parse_from(["ws-ckpt", "checkpoint", "-w", "/ws", "-i", "snap-4"]).unwrap();
+        match &cli.command {
+            Commands::Checkpoint {
+                snapshot,
+                legacy_id,
+                ..
+            } => {
+                assert!(snapshot.is_none());
+                assert_eq!(legacy_id.as_deref(), Some("snap-4"));
+            }
+            _ => panic!("expected Checkpoint"),
+        }
+    }
+
+    #[test]
+    fn parse_checkpoint_rejects_both_snapshot_and_id() {
+        let result = Cli::try_parse_from([
+            "ws-ckpt",
+            "checkpoint",
+            "-w",
+            "/ws",
+            "--snapshot",
+            "snap-1",
+            "--id",
+            "snap-2",
+        ]);
+        assert!(
+            result.is_err(),
+            "--snapshot and --id should be mutually exclusive"
+        );
     }
 
     // Cases that go through `snapshot_id_value_parser`. Each row is
@@ -1990,9 +2185,70 @@ mod tests {
         ])
         .unwrap();
         match cli.command {
-            Commands::Rollback { workspace, to } => {
+            Commands::Rollback {
+                workspace,
+                to,
+                num_ancestors,
+                preview,
+            } => {
                 assert_eq!(workspace, "/tmp/test");
-                assert_eq!(to, "msg1-step1");
+                assert_eq!(to.as_deref(), Some("msg1-step1"));
+                assert_eq!(num_ancestors, None);
+                assert!(!preview);
+            }
+            _ => panic!("expected Rollback"),
+        }
+    }
+
+    #[test]
+    fn parse_rollback_num_ancestors() {
+        let cli = Cli::try_parse_from([
+            "ws-ckpt",
+            "rollback",
+            "--workspace",
+            "/tmp/test",
+            "--num-ancestors",
+            "3",
+        ])
+        .unwrap();
+        match cli.command {
+            Commands::Rollback {
+                workspace,
+                to,
+                num_ancestors,
+                preview,
+            } => {
+                assert_eq!(workspace, "/tmp/test");
+                assert_eq!(to, None);
+                assert_eq!(num_ancestors, Some(3));
+                assert!(!preview);
+            }
+            _ => panic!("expected Rollback"),
+        }
+    }
+
+    #[test]
+    fn parse_rollback_preview() {
+        let cli = Cli::try_parse_from([
+            "ws-ckpt",
+            "rollback",
+            "--workspace",
+            "/tmp/test",
+            "--snapshot",
+            "msg1-step1",
+            "--preview",
+        ])
+        .unwrap();
+        match cli.command {
+            Commands::Rollback {
+                workspace,
+                to,
+                preview,
+                ..
+            } => {
+                assert_eq!(workspace, "/tmp/test");
+                assert_eq!(to.as_deref(), Some("msg1-step1"));
+                assert!(preview);
             }
             _ => panic!("expected Rollback"),
         }
@@ -2095,7 +2351,7 @@ mod tests {
 
     #[test]
     fn checkpoint_missing_workspace_fails() {
-        let result = Cli::try_parse_from(["ws-ckpt", "checkpoint", "--id", "snap-1"]);
+        let result = Cli::try_parse_from(["ws-ckpt", "checkpoint", "--snapshot", "snap-1"]);
         assert!(
             result.is_err(),
             "checkpoint without --workspace should fail"
@@ -2103,15 +2359,55 @@ mod tests {
     }
 
     #[test]
-    fn checkpoint_missing_id_fails() {
-        let result = Cli::try_parse_from(["ws-ckpt", "checkpoint", "--workspace", "/ws"]);
-        assert!(result.is_err(), "checkpoint without --id should fail");
+    fn checkpoint_missing_snapshot_parses_as_none() {
+        let cli = Cli::try_parse_from(["ws-ckpt", "checkpoint", "--workspace", "/ws"]).unwrap();
+        match cli.command {
+            Commands::Checkpoint {
+                snapshot,
+                legacy_id,
+                ..
+            } => {
+                assert!(snapshot.is_none());
+                assert!(legacy_id.is_none());
+            }
+            _ => panic!("expected Checkpoint"),
+        }
     }
 
     #[test]
-    fn rollback_missing_to_fails() {
-        let result = Cli::try_parse_from(["ws-ckpt", "rollback", "--workspace", "/ws"]);
-        assert!(result.is_err(), "rollback without --snapshot should fail");
+    fn generate_auto_id_matches_expected_format() {
+        let id = generate_auto_id();
+        assert!(
+            id.starts_with("ckpt-"),
+            "auto id should start with ckpt- prefix"
+        );
+        assert_eq!(
+            id.len(),
+            "ckpt-YYYYMMDDTHHmmss.fff".len(),
+            "auto id {:?} has unexpected length",
+            id
+        );
+        let body = &id[5..];
+        assert!(
+            body.chars()
+                .all(|c| c.is_ascii_digit() || c == 'T' || c == '.'),
+            "auto id body {:?} contains unexpected characters",
+            body
+        );
+    }
+
+    #[test]
+    fn rollback_missing_both_target_and_ancestors_parses_but_fields_none() {
+        let cli = Cli::try_parse_from(["ws-ckpt", "rollback", "--workspace", "/ws"]).unwrap();
+        match cli.command {
+            Commands::Rollback {
+                to, num_ancestors, ..
+            } => {
+                assert!(to.is_none());
+                assert!(num_ancestors.is_none());
+            }
+            _ => panic!("expected Rollback"),
+        }
     }
 
     // ── Metadata JSON validation ──
@@ -2126,7 +2422,7 @@ mod tests {
             "checkpoint",
             "--workspace",
             "/ws",
-            "--id",
+            "--snapshot",
             "snap-1",
             "--metadata",
             r#"{"key":"value"}"#,
@@ -2151,7 +2447,7 @@ mod tests {
             "checkpoint",
             "--workspace",
             "/ws",
-            "--id",
+            "--snapshot",
             "snap-1",
             "--metadata",
             "not-json",
@@ -2237,7 +2533,7 @@ mod tests {
             } => {
                 assert_eq!(workspace, "/tmp/test");
                 assert_eq!(from, "msg1-step0");
-                assert_eq!(to, "msg2-step0");
+                assert_eq!(to, Some("msg2-step0".to_string()));
             }
             _ => panic!("expected Diff"),
         }

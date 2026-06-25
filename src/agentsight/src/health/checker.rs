@@ -9,7 +9,7 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use super::port_detector::detect_listening_ports;
-use super::store::{AgentHealthState, AgentHealthStatus, HealthStore, now_ms};
+use super::store::{AgentHealthState, AgentHealthStatus, AgentRole, HealthStore, now_ms};
 use crate::discovery::AgentScanner;
 use crate::interruption::{InterruptionEvent, InterruptionType, was_pid_oom_killed};
 use crate::storage::sqlite::{GenAISqliteStore, InterruptionStore};
@@ -85,7 +85,18 @@ impl HealthChecker {
         // Mark gone processes as Offline (instead of deleting immediately)
         let newly_offline = if let Ok(mut store) = self.store.write() {
             store.last_scan_time = now_ms();
-            store.mark_stale_offline(&active_pids)
+            let offline = store.mark_stale_offline(&active_pids);
+            // 自动清理超过 5 分钟的 Offline 条目，避免历史 PID 在 Sidebar 长期残留
+            const OFFLINE_TTL_MS: u64 = 5 * 60 * 1000;
+            let removed = store.cleanup_stale_offline(OFFLINE_TTL_MS);
+            if removed > 0 {
+                log::info!(
+                    "HealthStore: cleaned {} stale offline entries (TTL={}s)",
+                    removed,
+                    OFFLINE_TTL_MS / 1000
+                );
+            }
+            offline
         } else {
             vec![]
         };
@@ -226,8 +237,20 @@ impl HealthChecker {
 
         log::debug!("Health check: found {} agent(s)", agents.len());
 
+        // Collect agent names by PID for role inference (detect parent-child within same agent)
+        let agent_name_by_pid: HashMap<u32, String> = agents
+            .iter()
+            .map(|a| (a.pid, a.agent_info.name.clone()))
+            .collect();
+
+        // Pre-scan listening ports per pid (also avoids scanning /proc twice).
+        let ports_by_pid: HashMap<u32, Vec<u16>> = agents
+            .iter()
+            .map(|a| (a.pid, detect_listening_ports(a.pid)))
+            .collect();
+
         for agent in &agents {
-            let ports = detect_listening_ports(agent.pid);
+            let ports = ports_by_pid.get(&agent.pid).cloned().unwrap_or_default();
             // Cosh has no daemon process and does not support keepalive/restart.
             // Build restart_cmd only for agents that support it.
             let restart_cmd = if agent.agent_info.name == "Cosh" {
@@ -235,6 +258,35 @@ impl HealthChecker {
             } else {
                 Some(build_restart_cmd(&agent.exe_path, &agent.cmdline_args))
             };
+
+            // Read parent PID from /proc/<pid>/stat for role inference
+            let ppid = read_ppid(agent.pid);
+
+            // Infer role:
+            //   1. ports != empty            → Gateway (real service with TCP port)
+            //   2. parent is same agent_name → Worker (genuine fork, fold under parent)
+            //   3. otherwise                 → Gateway (independent process, own card)
+            //
+            // Two separately-launched hermes/openclaw client instances are
+            // independent (no parent-child link, different terminals), so they
+            // each deserve their own primary card; only true forks go into the
+            // associated-processes drawer of their parent.
+            let role = if !ports.is_empty() {
+                AgentRole::Gateway
+            } else if let Some(pp) = ppid {
+                if agent_name_by_pid
+                    .get(&pp)
+                    .map(|n| n == &agent.agent_info.name)
+                    .unwrap_or(false)
+                {
+                    AgentRole::Worker
+                } else {
+                    AgentRole::Gateway
+                }
+            } else {
+                AgentRole::Gateway
+            };
+
             let status = if ports.is_empty() {
                 AgentHealthStatus {
                     pid: agent.pid,
@@ -247,9 +299,12 @@ impl HealthChecker {
                     latency_ms: None,
                     error_message: None,
                     restart_cmd,
+                    offline_since: None,
+                    role,
+                    parent_pid: ppid,
                 }
             } else {
-                self.probe_agent(agent, &ports, restart_cmd)
+                self.probe_agent(agent, &ports, restart_cmd, role, ppid)
             };
 
             if let Ok(mut store) = self.store.write() {
@@ -269,6 +324,8 @@ impl HealthChecker {
         agent: &crate::discovery::DiscoveredAgent,
         ports: &[u16],
         restart_cmd: Option<Vec<String>>,
+        role: AgentRole,
+        parent_pid: Option<u32>,
     ) -> AgentHealthStatus {
         let mut last_error = String::new();
         // 标记是否遇到了超时错误（区分 hung vs unreachable）
@@ -300,6 +357,9 @@ impl HealthChecker {
                         latency_ms: Some(latency),
                         error_message: None,
                         restart_cmd,
+                        offline_since: None,
+                        role: role.clone(),
+                        parent_pid,
                     };
                 }
                 Err(ureq::Error::Status(_code, _resp)) => {
@@ -315,6 +375,9 @@ impl HealthChecker {
                         latency_ms: Some(latency),
                         error_message: None,
                         restart_cmd,
+                        offline_since: None,
+                        role: role.clone(),
+                        parent_pid,
                     };
                 }
                 Err(ureq::Error::Transport(e)) => {
@@ -355,6 +418,9 @@ impl HealthChecker {
             latency_ms: None,
             error_message: Some(last_error),
             restart_cmd,
+            offline_since: None,
+            role,
+            parent_pid,
         }
     }
 
@@ -402,4 +468,18 @@ fn build_restart_cmd(exe_path: &str, cmdline_args: &[String]) -> Vec<String> {
         .collect();
     cmd.extend(args);
     cmd
+}
+
+/// Read the parent PID (ppid) from /proc/<pid>/stat.
+/// Returns None if the file cannot be read or parsed.
+fn read_ppid(pid: u32) -> Option<u32> {
+    let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
+    // Format: "pid (comm) state ppid ..."
+    // Find the closing ')' first (comm may contain spaces/parens)
+    let after_comm = stat.rsplit_once(')')?.1;
+    // after_comm = " state ppid ..."
+    let mut fields = after_comm.split_whitespace();
+    let _state = fields.next()?;
+    let ppid_str = fields.next()?;
+    ppid_str.parse::<u32>().ok()
 }

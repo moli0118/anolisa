@@ -7,6 +7,7 @@ from agent_sec_cli.security_events.orm_store import SqliteStore
 from agent_sec_cli.security_events.repositories import (
     CorrelationCandidate,
     SecurityEventRepository,
+    SecurityEventsSummary,
 )
 from agent_sec_cli.security_events.schema import SecurityEvent
 from sqlalchemy.engine import Engine
@@ -44,9 +45,15 @@ class SqliteEventReader:
         self,
         event_type: str | None = None,
         category: str | None = None,
+        result: str | None = None,
         trace_id: str | None = None,
+        session_id: str | None = None,
+        run_id: str | None = None,
+        call_id: str | None = None,
+        tool_call_id: str | None = None,
         since: str | None = None,
         until: str | None = None,
+        verdict: str | None = None,
         limit: int = 1000,
         offset: int = 0,
     ) -> list[SecurityEvent]:
@@ -54,12 +61,22 @@ class SqliteEventReader:
         return self._repository.query(
             event_type=event_type,
             category=category,
+            result=result,
             trace_id=trace_id,
+            session_id=session_id,
+            run_id=run_id,
+            call_id=call_id,
+            tool_call_id=tool_call_id,
             since=since,
             until=until,
+            verdict=verdict,
             limit=limit,
             offset=offset,
         )
+
+    def get(self, event_id: str) -> SecurityEvent | None:
+        """Return one security event by id."""
+        return self._repository.get(event_id)
 
     def query_correlation_candidates(
         self,
@@ -87,18 +104,30 @@ class SqliteEventReader:
         self,
         event_type: str | None = None,
         category: str | None = None,
+        result: str | None = None,
         trace_id: str | None = None,
+        session_id: str | None = None,
+        run_id: str | None = None,
+        call_id: str | None = None,
+        tool_call_id: str | None = None,
         since: str | None = None,
         until: str | None = None,
+        verdict: str | None = None,
         offset: int = 0,
     ) -> int:
         """Count events matching the given filters."""
         return self._repository.count(
             event_type=event_type,
             category=category,
+            result=result,
             trace_id=trace_id,
+            session_id=session_id,
+            run_id=run_id,
+            call_id=call_id,
+            tool_call_id=tool_call_id,
             since=since,
             until=until,
+            verdict=verdict,
             offset=offset,
         )
 
@@ -107,9 +136,15 @@ class SqliteEventReader:
         group_field: str,
         event_type: str | None = None,
         category: str | None = None,
+        result: str | None = None,
         trace_id: str | None = None,
+        session_id: str | None = None,
+        run_id: str | None = None,
+        call_id: str | None = None,
+        tool_call_id: str | None = None,
         since: str | None = None,
         until: str | None = None,
+        verdict: str | None = None,
         offset: int = 0,
     ) -> dict[str, int]:
         """Count events grouped by a specific field."""
@@ -117,8 +152,45 @@ class SqliteEventReader:
             group_field,
             event_type=event_type,
             category=category,
+            result=result,
             trace_id=trace_id,
+            session_id=session_id,
+            run_id=run_id,
+            call_id=call_id,
+            tool_call_id=tool_call_id,
             since=since,
             until=until,
+            verdict=verdict,
             offset=offset,
+        )
+
+    def summary(
+        self,
+        event_type: str | None = None,
+        category: str | None = None,
+        result: str | None = None,
+        trace_id: str | None = None,
+        session_id: str | None = None,
+        run_id: str | None = None,
+        call_id: str | None = None,
+        tool_call_id: str | None = None,
+        since: str | None = None,
+        until: str | None = None,
+        verdict: str | None = None,
+        latest_limit: int = 5,
+    ) -> SecurityEventsSummary:
+        """Return dashboard summary aggregates and latest events."""
+        return self._repository.summary(
+            event_type=event_type,
+            category=category,
+            result=result,
+            trace_id=trace_id,
+            session_id=session_id,
+            run_id=run_id,
+            call_id=call_id,
+            tool_call_id=tool_call_id,
+            since=since,
+            until=until,
+            verdict=verdict,
+            latest_limit=latest_limit,
         )

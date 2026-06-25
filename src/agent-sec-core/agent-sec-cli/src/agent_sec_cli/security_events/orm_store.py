@@ -9,13 +9,16 @@ from pathlib import Path
 from typing import Any
 
 from agent_sec_cli.security_events.orm_base import Base
+from agent_sec_cli.security_events.schema_version import (
+    SECURITY_EVENTS_SQLITE_SCHEMA_VERSION,
+)
 from sqlalchemy import create_engine, event, inspect, text
 from sqlalchemy.engine import URL, Connection, Engine
 from sqlalchemy.exc import DatabaseError, SQLAlchemyError
 from sqlalchemy.orm import Session, sessionmaker
 from sqlalchemy.schema import CreateIndex, CreateTable
 
-_SCHEMA_VERSION = 2
+_SCHEMA_VERSION = SECURITY_EVENTS_SQLITE_SCHEMA_VERSION
 _SQLITE_PRIMARY_CODE_MASK = 0xFF
 _SQLITE_CORRUPTION_CODES = {
     sqlite3.SQLITE_CORRUPT,
@@ -145,10 +148,10 @@ def ensure_schema(
     model_tuple = _coerce_models(models)
     with engine.connect() as conn:
         conn.execute(text("PRAGMA journal_mode=WAL"))
-    with engine.begin() as conn:
         version = conn.execute(text("PRAGMA user_version")).scalar_one()
         if version > schema_version:
             _warn_newer_schema_version(int(version), schema_version, log_prefix)
+            conn.commit()
             return
 
         conn.execute(text("PRAGMA auto_vacuum = INCREMENTAL"))
@@ -160,6 +163,15 @@ def ensure_schema(
                 model_tuple,
                 log_prefix,
             )
+        conn.commit()
+
+    with engine.begin() as conn:
+        version = conn.execute(text("PRAGMA user_version")).scalar_one()
+        if version > schema_version:
+            _warn_newer_schema_version(int(version), schema_version, log_prefix)
+            return
+
+        conn.execute(text("PRAGMA auto_vacuum = INCREMENTAL"))
 
         for model in model_tuple:
             table = model.__table__

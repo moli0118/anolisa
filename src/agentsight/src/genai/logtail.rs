@@ -16,9 +16,16 @@ use super::exporter::GenAIExporter;
 use super::instance_id;
 use super::semantic::GenAISemanticEvent;
 use crate::interruption::types::InterruptionEvent;
+use crate::skill_metrics::extractor::extract_skill_load_counts_from_messages;
 
 /// 环境变量名称
 pub const LOGTAIL_ENV_VAR: &str = "SLS_LOGTAIL_FILE";
+
+/// 默认 SLS Logtail 输出路径。
+///
+/// 当 `SLS_LOGTAIL_FILE` 环境变量未指向 `/var/sysom/` 目录时，
+/// AgentSight 使用此路径作为本地默认 SLS 输出文件。
+pub const DEFAULT_SLS_LOGTAIL_PATH: &str = "/var/log/anolisa/sls/ops/agentsight.jsonl";
 
 /// 动态 Logtail 路径（由 config watcher 运行时设置）
 static DYNAMIC_LOGTAIL_PATH: std::sync::RwLock<Option<String>> = std::sync::RwLock::new(None);
@@ -65,6 +72,28 @@ pub fn logtail_path() -> Option<String> {
     DYNAMIC_LOGTAIL_PATH.read().ok().and_then(|g| g.clone())
 }
 
+/// 返回当前应写入 SLS Logtail 的所有活动路径。
+///
+/// 规则与 `unified.rs` 中的 exporter 注册逻辑保持一致：
+/// - 若 `SLS_LOGTAIL_FILE` 指向 `/var/sysom/` 目录，仅返回该 sysom 路径；
+/// - 否则返回 `SLS_LOGTAIL_FILE`（如有）与 [`DEFAULT_SLS_LOGTAIL_PATH`] 的组合。
+///
+/// 返回的列表已去重，避免同一文件被重复写入。
+pub fn active_logtail_paths() -> Vec<std::path::PathBuf> {
+    let mut paths = Vec::new();
+    if let Some(p) = logtail_path() {
+        if p.starts_with("/var/sysom/") {
+            return vec![std::path::PathBuf::from(p)];
+        }
+        paths.push(std::path::PathBuf::from(p));
+    }
+    let default = std::path::PathBuf::from(DEFAULT_SLS_LOGTAIL_PATH);
+    if !paths.contains(&default) {
+        paths.push(default);
+    }
+    paths
+}
+
 /// iLogtail 文件导出器
 ///
 /// 将 GenAI 事件以扁平化 JSON 格式（每行一条记录）写入指定路径，
@@ -84,6 +113,10 @@ pub struct LogtailExporter {
     /// 路径为空（被清空）则丢弃本批次，实现可逆的"暂停 / 恢复"语义；
     /// 为 `false` 时（环境变量启动模式）始终写入构造时锁定的 `path`。
     dynamic: bool,
+    /// 写入前是否要求目标路径已存在。
+    /// 用于默认 SLS 路径：若 `/var/log/anolisa/sls/ops/agentsight.jsonl`
+    /// 不存在（iLogtail 未部署或目录未挂载），则跳过写入，避免自动创建文件。
+    require_path_exists: bool,
 }
 
 impl LogtailExporter {
@@ -118,37 +151,93 @@ impl LogtailExporter {
             encryptor,
             trace_enabled,
             dynamic: false,
+            require_path_exists: false,
         })
     }
 
-    /// 从显式路径创建 Logtail 导出器（用于运行时动态激活）
+    /// 创建默认路径的 Logtail 导出器。
     ///
-    /// 与 `new()` 不同，不依赖环境变量，直接使用传入的路径。
-    pub fn new_with_path(
-        path_str: &str,
-        encryption_pem: Option<&str>,
-        trace_enabled: bool,
-    ) -> Self {
-        let path = PathBuf::from(path_str);
+    /// 固定写入 [`DEFAULT_SLS_LOGTAIL_PATH`]，不受 `SLS_LOGTAIL_FILE`
+    /// 环境变量或动态配置影响。用于非 sysom 模式下的本地默认 SLS 输出。
+    pub fn new_default(encryption_pem: Option<&str>, trace_enabled: bool) -> Self {
+        let path = PathBuf::from(DEFAULT_SLS_LOGTAIL_PATH);
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent).ok();
         }
         let encryptor = encryption_pem.and_then(MessageEncryptor::from_pem);
         if encryptor.is_none() {
             log::info!(
-                "Logtail exporter (dynamic): encryption disabled (no public key configured)"
+                "Logtail exporter (default): encryption disabled (no public key configured)"
             );
         }
         if !trace_enabled {
             log::info!(
-                "Logtail exporter (dynamic): traceEnabled=false, conversation content fields (gen_ai.system_instructions, gen_ai.input.messages, gen_ai.output.messages) will NOT be uploaded"
+                "Logtail exporter (default): traceEnabled=false, conversation content fields (gen_ai.system_instructions, gen_ai.input.messages, gen_ai.output.messages) will NOT be uploaded"
             );
         }
         LogtailExporter {
             path,
             encryptor,
             trace_enabled,
-            dynamic: true,
+            dynamic: false,
+            require_path_exists: true,
+        }
+    }
+
+    /// 从显式路径创建 Logtail 导出器（用于运行时动态激活）
+    ///
+    /// 与 `new()` 不同，不依赖环境变量，直接使用传入的路径。
+    /// 创建的导出器为动态模式，每次 `export()` 都会重新读取最新路径。
+    pub fn new_with_path(
+        path_str: &str,
+        encryption_pem: Option<&str>,
+        trace_enabled: bool,
+    ) -> Self {
+        Self::new_with_path_dynamic(path_str, encryption_pem, trace_enabled, true)
+    }
+
+    /// 从显式路径创建固定路径的 Logtail 导出器。
+    ///
+    /// 与 `new_with_path` 不同，创建的导出器为静态模式，始终写入构造时
+    /// 锁定的路径，不受环境变量或动态配置变化影响。
+    pub fn new_with_fixed_path(
+        path_str: &str,
+        encryption_pem: Option<&str>,
+        trace_enabled: bool,
+    ) -> Self {
+        Self::new_with_path_dynamic(path_str, encryption_pem, trace_enabled, false)
+    }
+
+    fn new_with_path_dynamic(
+        path_str: &str,
+        encryption_pem: Option<&str>,
+        trace_enabled: bool,
+        dynamic: bool,
+    ) -> Self {
+        let path = PathBuf::from(path_str);
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent).ok();
+        }
+        let encryptor = encryption_pem.and_then(MessageEncryptor::from_pem);
+        let label = if dynamic { "dynamic" } else { "fixed" };
+        if encryptor.is_none() {
+            log::info!(
+                "Logtail exporter ({}): encryption disabled (no public key configured)",
+                label
+            );
+        }
+        if !trace_enabled {
+            log::info!(
+                "Logtail exporter ({}): traceEnabled=false, conversation content fields (gen_ai.system_instructions, gen_ai.input.messages, gen_ai.output.messages) will NOT be uploaded",
+                label
+            );
+        }
+        LogtailExporter {
+            path,
+            encryptor,
+            trace_enabled,
+            dynamic,
+            require_path_exists: false,
         }
     }
 
@@ -177,6 +266,10 @@ impl LogtailExporter {
         } else {
             self.path.clone()
         };
+
+        if self.require_path_exists && !target_path.exists() {
+            return;
+        }
 
         let records = events_to_flat_records(events, self.encryptor.as_ref(), self.trace_enabled);
         if records.is_empty() {
@@ -437,6 +530,9 @@ pub fn events_to_flat_records(
                 if let Some(path) = call.metadata.get("path") {
                     m.insert("agentsight.http.path".to_string(), path.clone());
                 }
+                if let Some(domain) = call.metadata.get("http.domain") {
+                    m.insert("agentsight.http.domain".to_string(), domain.clone());
+                }
                 if let Some(status) = call.metadata.get("status_code") {
                     m.insert("agentsight.http.status_code".to_string(), status.clone());
                 }
@@ -462,6 +558,27 @@ pub fn events_to_flat_records(
                 }
                 if let Some(sid) = call.metadata.get("session_id") {
                     m.insert("gen_ai.session.id".to_string(), sid.clone());
+                }
+
+                // ── AgentSkill extensions: skill names and counts as JSON arrays ──
+                // Default to null when no skills are detected; write arrays when present.
+                let skill_counts = extract_skill_load_counts_from_messages(&call.response.messages);
+                if skill_counts.is_empty() {
+                    m.insert("agent.skill.name".to_string(), "null".to_string());
+                    m.insert("agent.skill.load_count".to_string(), "null".to_string());
+                } else {
+                    let mut skill_pairs: Vec<(String, u64)> = skill_counts.into_iter().collect();
+                    skill_pairs.sort_by(|a, b| a.0.cmp(&b.0));
+                    let names: Vec<String> = skill_pairs.iter().map(|(k, _)| k.clone()).collect();
+                    let counts: Vec<u64> = skill_pairs.iter().map(|(_, v)| *v).collect();
+                    m.insert(
+                        "agent.skill.name".to_string(),
+                        serde_json::to_string(&names).unwrap_or_default(),
+                    );
+                    m.insert(
+                        "agent.skill.load_count".to_string(),
+                        serde_json::to_string(&counts).unwrap_or_default(),
+                    );
                 }
             }
             GenAISemanticEvent::ToolUse(tool) => {
@@ -603,19 +720,17 @@ pub fn interruption_events_to_flat_records(
 
 /// 将中断事件批量导出到 iLogtail 文件（追加写入）
 ///
-/// 仅在环境变量 `SLS_LOGTAIL_FILE` 设置时生效；否则为空操作。
-/// 与 `LogtailExporter::write_batch` 写入同一文件，由 iLogtail 统一采集到 SLS。
+/// 写入路径与 `LogtailExporter::write_batch` 保持一致：
+/// - 若 `SLS_LOGTAIL_FILE` 指向 `/var/sysom/` 目录，仅写入该 sysom 路径；
+/// - 否则写入 `SLS_LOGTAIL_FILE`（如有）与 [`DEFAULT_SLS_LOGTAIL_PATH`] 的组合。
+/// 由 iLogtail 统一采集到 SLS。
 pub fn export_interruption_events(events: &[InterruptionEvent]) {
     if events.is_empty() {
         return;
     }
-    let path_str = match logtail_path() {
-        Some(p) => p,
-        None => return,
-    };
-    let path = PathBuf::from(path_str);
-    if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent).ok();
+    let paths = active_logtail_paths();
+    if paths.is_empty() {
+        return;
     }
 
     let records = interruption_events_to_flat_records(events);
@@ -623,7 +738,19 @@ pub fn export_interruption_events(events: &[InterruptionEvent]) {
         return;
     }
 
-    let file = match OpenOptions::new().create(true).append(true).open(&path) {
+    for path in &paths {
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent).ok();
+        }
+        write_interruption_records_to_path(path, &records);
+    }
+}
+
+fn write_interruption_records_to_path(
+    path: &std::path::Path,
+    records: &[BTreeMap<String, String>],
+) {
+    let file = match OpenOptions::new().create(true).append(true).open(path) {
         Ok(f) => f,
         Err(e) => {
             log::warn!("Failed to open logtail file {path:?} for interruption export: {e}");
@@ -632,7 +759,7 @@ pub fn export_interruption_events(events: &[InterruptionEvent]) {
     };
 
     let mut writer = BufWriter::new(file);
-    for record in &records {
+    for record in records {
         match serde_json::to_string(record) {
             Ok(json_line) => {
                 if let Err(e) = writeln!(writer, "{json_line}") {
@@ -834,5 +961,225 @@ mod tests {
         );
         assert_eq!(r.get("gen_ai.tool.name").map(String::as_str), Some("shell"));
         assert_eq!(r.get("agentsight.pid").map(String::as_str), Some("7"));
+    }
+
+    // Serialize tests that mutate the process-wide SLS_LOGTAIL_FILE env var
+    // or the global dynamic logtail path.
+    static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    fn reset_logtail_state() {
+        // SAFETY: tests acquire ENV_LOCK before mutating this variable,
+        // so no other test thread can observe a race.
+        unsafe { std::env::remove_var(LOGTAIL_ENV_VAR) };
+        set_dynamic_logtail_path("");
+    }
+
+    #[test]
+    fn test_active_logtail_paths_default() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        reset_logtail_state();
+        let paths = active_logtail_paths();
+        assert_eq!(paths.len(), 1);
+        assert_eq!(paths[0], PathBuf::from(DEFAULT_SLS_LOGTAIL_PATH));
+    }
+
+    #[test]
+    fn test_active_logtail_paths_env_combined_with_default() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        reset_logtail_state();
+        let tmp = std::env::temp_dir().join(format!("agentsight_logtail_{}", std::process::id()));
+        let env_path = tmp.join("env.jsonl");
+        // SAFETY: tests acquire ENV_LOCK before mutating this variable.
+        unsafe { std::env::set_var(LOGTAIL_ENV_VAR, env_path.to_str().unwrap()) };
+
+        let paths = active_logtail_paths();
+        assert_eq!(paths.len(), 2);
+        assert!(paths.contains(&PathBuf::from(DEFAULT_SLS_LOGTAIL_PATH)));
+        assert!(paths.contains(&env_path));
+
+        std::fs::remove_dir_all(&tmp).ok();
+        reset_logtail_state();
+    }
+
+    #[test]
+    fn test_active_logtail_paths_env_equals_default_deduped() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        reset_logtail_state();
+        // SAFETY: tests acquire ENV_LOCK before mutating this variable.
+        unsafe { std::env::set_var(LOGTAIL_ENV_VAR, DEFAULT_SLS_LOGTAIL_PATH) };
+
+        let paths = active_logtail_paths();
+        assert_eq!(paths.len(), 1);
+        assert_eq!(paths[0], PathBuf::from(DEFAULT_SLS_LOGTAIL_PATH));
+        reset_logtail_state();
+    }
+
+    #[test]
+    fn test_active_logtail_paths_sysom_only() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        reset_logtail_state();
+        let sysom_path = "/var/sysom/ilog/agentsight/agentsight.jsonl";
+        // SAFETY: tests acquire ENV_LOCK before mutating this variable.
+        unsafe { std::env::set_var(LOGTAIL_ENV_VAR, sysom_path) };
+
+        let paths = active_logtail_paths();
+        assert_eq!(paths.len(), 1);
+        assert_eq!(paths[0], PathBuf::from(sysom_path));
+        reset_logtail_state();
+    }
+
+    #[test]
+    fn test_logtail_exporter_new_default_path() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        reset_logtail_state();
+        let exporter = LogtailExporter::new_default(None, false);
+        assert_eq!(exporter.path(), PathBuf::from(DEFAULT_SLS_LOGTAIL_PATH));
+        reset_logtail_state();
+    }
+
+    #[test]
+    fn test_default_exporter_skips_when_path_missing() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        reset_logtail_state();
+
+        // Use a path under a temp directory that does not exist.
+        let tmp =
+            std::env::temp_dir().join(format!("agentsight_default_missing_{}", std::process::id()));
+        let exporter = LogtailExporter {
+            path: tmp.join("agentsight.jsonl"),
+            encryptor: None,
+            trace_enabled: true,
+            dynamic: false,
+            require_path_exists: true,
+        };
+
+        let event = GenAISemanticEvent::LLMCall(make_full_llm_call());
+        exporter.export(&[event]);
+
+        assert!(!tmp.exists());
+        reset_logtail_state();
+    }
+
+    #[test]
+    fn test_default_exporter_writes_when_path_exists() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        reset_logtail_state();
+
+        let tmp =
+            std::env::temp_dir().join(format!("agentsight_default_exists_{}", std::process::id()));
+        std::fs::create_dir_all(&tmp).unwrap();
+        let path = tmp.join("agentsight.jsonl");
+        std::fs::write(&path, "").unwrap();
+
+        let exporter = LogtailExporter {
+            path: path.clone(),
+            encryptor: None,
+            trace_enabled: true,
+            dynamic: false,
+            require_path_exists: true,
+        };
+
+        let event = GenAISemanticEvent::LLMCall(make_full_llm_call());
+        exporter.export(&[event]);
+
+        let content = std::fs::read_to_string(&path).unwrap();
+        assert!(!content.is_empty());
+        assert!(content.contains("\"gen_ai.operation.name\""));
+
+        std::fs::remove_dir_all(&tmp).ok();
+        reset_logtail_state();
+    }
+
+    #[test]
+    fn test_logtail_exporter_new_with_fixed_path() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        reset_logtail_state();
+        let tmp = std::env::temp_dir().join(format!("agentsight_fixed_{}", std::process::id()));
+        let path = tmp.join("fixed.jsonl");
+        let exporter = LogtailExporter::new_with_fixed_path(path.to_str().unwrap(), None, false);
+        assert_eq!(exporter.path(), path);
+        std::fs::remove_dir_all(&tmp).ok();
+        reset_logtail_state();
+    }
+
+    #[test]
+    fn test_skill_fields_in_llm_call_records() {
+        let mut call = make_full_llm_call();
+        call.response.messages.push(OutputMessage {
+            role: "assistant".to_string(),
+            parts: vec![
+                MessagePart::ToolCall {
+                    id: Some("tc-1".to_string()),
+                    name: "Skill".to_string(),
+                    arguments: Some(serde_json::json!({"skill": "pdf"})),
+                },
+                MessagePart::ToolCall {
+                    id: Some("tc-2".to_string()),
+                    name: "read_file".to_string(),
+                    arguments: Some(serde_json::json!({"file_path": "/skills/read/SKILL.md"})),
+                },
+            ],
+            name: None,
+            finish_reason: None,
+        });
+
+        let event = GenAISemanticEvent::LLMCall(call);
+        let records = events_to_flat_records(&[event], None, false);
+        assert_eq!(records.len(), 1);
+        let r = &records[0];
+        assert_eq!(
+            r.get("agent.skill.name").map(String::as_str),
+            Some("[\"pdf\",\"read\"]")
+        );
+        assert_eq!(
+            r.get("agent.skill.load_count").map(String::as_str),
+            Some("[1,1]")
+        );
+    }
+
+    #[test]
+    fn test_skill_fields_default_null_when_no_skills() {
+        // When no skill tool calls are present, fields should default to null.
+        let event = GenAISemanticEvent::LLMCall(make_full_llm_call());
+        let records = events_to_flat_records(&[event], None, false);
+        assert_eq!(records.len(), 1);
+        let r = &records[0];
+        assert_eq!(r.get("agent.skill.name").map(String::as_str), Some("null"));
+        assert_eq!(
+            r.get("agent.skill.load_count").map(String::as_str),
+            Some("null")
+        );
+    }
+
+    #[test]
+    fn test_export_interruption_events_writes_records() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        reset_logtail_state();
+        let tmp =
+            std::env::temp_dir().join(format!("agentsight_interruption_{}", std::process::id()));
+        let path = tmp.join("interruption.jsonl");
+        // SAFETY: tests acquire ENV_LOCK before mutating this variable.
+        unsafe { std::env::set_var(LOGTAIL_ENV_VAR, path.to_str().unwrap()) };
+
+        let event = InterruptionEvent::new(
+            crate::interruption::InterruptionType::AgentCrash,
+            Some("session-1".to_string()),
+            None,
+            Some("conv-1".to_string()),
+            None,
+            Some(42),
+            Some("test-agent".to_string()),
+            1_000_000,
+            Some(serde_json::json!({"pid": 42})),
+        );
+        export_interruption_events(&[event]);
+
+        let content = std::fs::read_to_string(&path).unwrap();
+        assert!(!content.is_empty());
+        assert!(content.contains("agent_crash"));
+        assert!(content.contains("session-1"));
+
+        std::fs::remove_dir_all(&tmp).ok();
+        reset_logtail_state();
     }
 }

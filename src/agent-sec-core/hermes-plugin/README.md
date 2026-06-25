@@ -122,17 +122,21 @@ Hermes 支持的 hook 及其回调签名：
 
 ### Skill Ledger
 
-`skill-ledger` 在 Hermes `skill_view` 读取技能前执行完整性检查：
+推荐部署模式是 SkillFS + Skill Ledger daemon activation：SkillFS 捕获 skill 变更，daemon 刷新 `.skill-meta/activation.json`/xattr。Hermes `skill-ledger` capability 默认仍注册，但默认 `policy = "debug"`：在 Hermes `skill_view` 读取技能前执行完整性检查，只写 debug 诊断，不阻断、不向最终回复追加 warning。
 
-- 默认 `enable_block = false`：不阻断读取；非 `pass` 状态会缓存为本轮告警，并通过
+- `enabled = false`：完全不注册 Hermes hook。
+- `policy = "debug"`：默认静默兼容模式；非 `pass`、CLI 失败或 JSON 解析失败都 fail-open，只写 debug。
+- `policy = "warn"`：恢复 warning-only 兼容模式；非 `pass` 状态会缓存为本轮告警，并通过
   `transform_llm_output` 追加到最终回复开头，确保用户可见。
-- `enable_block = true`：命中 `block_statuses` 时直接返回 Hermes block 结果；此模式不再追加
-  warning。
+- `policy = "block"`：命中 `block_statuses` 时直接返回 Hermes block 结果；未命中状态仅写 warning 诊断。
+- 未配置 `policy` 的旧配置仍兼容：`enable_block = true` 映射为 `block`，`enable_block = false` 映射为 `warn`。
 - 当前版本仅覆盖 Hermes 默认本地技能目录 `~/.hermes/skills`，按 Hermes `skill_view`
   的本地目录规则解析 `category/skill` 或裸 skill 名称；`skills.external_dirs` 和
   plugin-provided skills 暂不覆盖，hook 会 fail-open 跳过。
 - `file_path` / `path` 仅表示 skill 内 supporting file，不参与 skill 目录定位。
-- `max_warnings_per_turn = 0` 表示关闭用户可见 warning 注入，仅保留日志。
+- `max_warnings_per_turn = 0` 仅影响 `policy = "warn"` 的用户可见 warning 注入。
+- Skill Ledger 全局 `activationPolicy` 属于 SkillFS/daemon activation；这里的 hook `policy`
+  只控制宿主 hook 的可见行为和日志等级。
 
 配置示例：
 
@@ -140,11 +144,14 @@ Hermes 支持的 hook 及其回调签名：
 [capabilities.skill-ledger]
 enabled = true
 timeout = 5
+policy = "debug"
 enable_block = false
 block_statuses = ["none", "drifted", "deny", "tampered"]
 max_warnings_per_turn = 5
 max_warning_contexts = 128
 ```
+
+无 SkillFS 且希望用户可见提示或阻断时，将 `policy` 显式改为 `warn` 或 `block`。
 
 ### observability
 
@@ -186,17 +193,17 @@ CLI 调用方式和 `openclaw-plugin` 保持一致：helper 将一条 JSON paylo
 
 ### pii-scan-user-input
 
-`pii-scan-user-input` 对齐 Cosh/OpenClaw PII checker v1 语义：
+`pii-scan-user-input` 对齐 Cosh/OpenClaw 多点位 PII checker 语义：
 
-- 挂在 `pre_llm_call`、`transform_llm_output`、`on_session_end`
-- 只扫描本轮用户输入，不扫描 history、tool output 或 terminal 原始输出
-- 调用 `agent-sec-cli scan-pii --stdin --format json --source user_input`，敏感原文仅通过 stdin 传入子进程
-- `warn` / `deny` 不阻断请求，只缓存脱敏 warning
-- `transform_llm_output` 在最终回复前 prepend warning，成功交付后清理缓存
+- 挂在 `pre_llm_call`、`pre_tool_call`、`post_tool_call`、`transform_llm_output`、`on_session_end`
+- 扫描本轮用户输入、tool 参数、tool 返回结果和最终模型回复；不扫描 history、memory 或 RAG context
+- 调用 `agent-sec-cli scan-pii --stdin --format json --redact-output --source <source>`，敏感原文仅通过 stdin 传入子进程
+- tool 参数/结果的 `warn` / `deny` 不阻断请求，只缓存脱敏 warning
+- `transform_llm_output` 会扫描最终模型回复；命中时使用 `redacted_text` 替换用户可见回复，并 prepend 已缓存 warning
 - 当前实现依赖 Hermes 对完整最终回复调用一次 `transform_llm_output`；若未来改成流式分片 transform，需要重新审视 warning pop 语义
 - `on_session_end` 清理残留缓存
 - 所有异常、超时、非 JSON 输出、未知 verdict 都 fail-open
-- warning 只使用 `evidence_redacted`，不展示 raw evidence 或原始用户输入
+- warning 只使用 `evidence_redacted`，不展示 raw evidence 或原始文本
 
 ### prompt-scan-user-input
 

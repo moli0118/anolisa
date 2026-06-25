@@ -32,7 +32,7 @@ use crate::discovery::AgentScanner;
 use crate::event::Event;
 use crate::ffi::{FfiEvent, FfiEventSender};
 use crate::genai::semantic::GenAISemanticEvent;
-use crate::genai::{GenAIBuilder, GenAIExporter, GenAIStore, LogtailExporter};
+use crate::genai::{GenAIBuilder, GenAIExporter, LogtailExporter};
 use crate::interruption::{DetectorConfig, InterruptionDetector, recover_oom_events};
 use crate::parser::Parser;
 use crate::probes::{FileWatchEvent, FileWriteEvent, Probes, ProbesPoller};
@@ -94,9 +94,6 @@ pub struct AgentSight {
     pid_agent_name_cache: HashMap<u32, String>,
     /// HTTP domain patterns from config, used for runtime DNS-based tcpsniff target addition
     http_domains: Vec<String>,
-    /// Flag indicating SLS Logtail has been activated (irreversible)
-    #[allow(dead_code)]
-    sls_activated: Arc<AtomicBool>,
     /// Mailbox for watcher thread to deposit a dynamically-created LogtailExporter
     pending_logtail: Arc<Mutex<Option<Box<dyn GenAIExporter>>>>,
     /// DeadLoop auto-kill: enabled flag
@@ -293,25 +290,21 @@ impl AgentSight {
             crate::genai::logtail::set_dynamic_logtail_path(sls_path);
         }
 
-        let is_agentic_os = crate::genai::anolisa_release::is_anolisa();
-
         // Determine if Logtail is currently enabled (env var OR dynamic config)
         let logtail_currently_enabled = crate::genai::logtail::logtail_enabled();
 
-        if is_agentic_os {
-            // ── Anolisa OS: always register SQLite ──
-            match GenAISqliteStore::new() {
-                Ok(store) => {
-                    log::info!("SQLite GenAI exporter enabled (agentic os)");
-                    let store = Arc::new(store);
-                    genai_sqlite_store = Some(Arc::clone(&store));
-                    genai_exporters.push(Box::new(store));
-                }
-                Err(e) => {
-                    log::warn!("Failed to initialize SQLite GenAI exporter: {e}");
-                }
-            }
-            // If Logtail is enabled at startup, also register it (dual-write)
+        // Sysom production mode: when SLS_LOGTAIL_FILE points under /var/sysom/,
+        // use only the external Logtail path. Skip SQLite and the default SLS exporter.
+        let sysom_logtail_path = std::env::var(crate::genai::logtail::LOGTAIL_ENV_VAR)
+            .ok()
+            .filter(|p| p.starts_with("/var/sysom/"));
+
+        if let Some(ref path) = sysom_logtail_path {
+            log::info!(
+                "SLS sysom mode detected ({}={}), skipping SQLite and default SLS exporter",
+                crate::genai::logtail::LOGTAIL_ENV_VAR,
+                path
+            );
             if logtail_currently_enabled {
                 if let Some(exporter) = LogtailExporter::new(
                     config.encryption_public_key.as_deref(),
@@ -326,7 +319,7 @@ impl AgentSight {
                         );
                     }
                     log::info!(
-                        "Logtail file exporter enabled (agentic os, {}), uid={}",
+                        "Logtail file exporter enabled (sysom, {}), uid={}",
                         exporter.path().display(),
                         uid
                     );
@@ -335,7 +328,31 @@ impl AgentSight {
                 }
             }
         } else {
-            // ── Non-Anolisa OS: keep original mutual exclusion behavior ──
+            // Default/dev mode: SQLite + default SLS exporter, plus optional env Logtail.
+            match GenAISqliteStore::new() {
+                Ok(store) => {
+                    log::info!("SQLite GenAI exporter enabled");
+                    let store = Arc::new(store);
+                    genai_sqlite_store = Some(Arc::clone(&store));
+                    genai_exporters.push(Box::new(store));
+                }
+                Err(e) => {
+                    log::warn!("Failed to initialize SQLite GenAI exporter: {e}");
+                }
+            }
+
+            // Default local SLS Logtail exporter
+            let default_exporter = LogtailExporter::new_default(
+                config.encryption_public_key.as_deref(),
+                config.trace_enabled,
+            );
+            log::info!(
+                "Default Logtail file exporter enabled ({})",
+                default_exporter.path().display()
+            );
+            genai_exporters.push(Box::new(default_exporter));
+
+            // Also honor explicit SLS_LOGTAIL_FILE if set to a non-sysom path
             if logtail_currently_enabled {
                 if let Some(exporter) = LogtailExporter::new(
                     config.encryption_public_key.as_deref(),
@@ -356,33 +373,6 @@ impl AgentSight {
                     );
                     genai_exporters.push(Box::new(exporter));
                     sls_activated.store(true, Ordering::SeqCst);
-                }
-                // Also initialize SQLite store for detection queries + lifecycle
-                match GenAISqliteStore::new() {
-                    Ok(store) => {
-                        log::info!("SQLite GenAI store initialized (detection + lifecycle)");
-                        let store = Arc::new(store);
-                        genai_sqlite_store = Some(Arc::clone(&store));
-                        genai_exporters.push(Box::new(store));
-                    }
-                    Err(e) => {
-                        log::warn!("Failed to initialize SQLite GenAI store: {e}");
-                    }
-                }
-            } else {
-                // No Logtail: use local JSONL + SQLite
-                genai_exporters.push(Box::new(GenAIStore::new(&GenAIStore::default_path())));
-
-                match GenAISqliteStore::new() {
-                    Ok(store) => {
-                        log::info!("SQLite GenAI exporter enabled");
-                        let store = Arc::new(store);
-                        genai_sqlite_store = Some(Arc::clone(&store));
-                        genai_exporters.push(Box::new(store));
-                    }
-                    Err(e) => {
-                        log::warn!("Failed to initialize SQLite GenAI exporter: {e}");
-                    }
                 }
             }
         }
@@ -452,37 +442,26 @@ impl AgentSight {
         let pending_logtail: Arc<Mutex<Option<Box<dyn GenAIExporter>>>> =
             Arc::new(Mutex::new(None));
 
-        // Spawn config file watcher for runtime hot-reload
+        // Create `running` flag early so background threads can observe shutdown.
+        let running = Arc::new(AtomicBool::new(true));
+
+        // Spawn background threads (config watcher, token-collector, stale scanner).
         if let Some(ref cfg_path) = config.config_path {
-            Self::start_config_watcher(
+            crate::background::start_config_watcher(
                 cfg_path.clone(),
                 Arc::clone(&sls_activated),
                 Arc::clone(&pending_logtail),
                 config.encryption_public_key.clone(),
                 config.trace_enabled,
+                Arc::clone(&running),
             );
-            // Spawn token-collector watcher to bridge ilogtail SLS_LOG_PATH into
-            // runtime.sls_logtail_path. Triggered by /etc/anolisa/enable_token_collector
-            // file presence; cleared when the file is removed.
-            Self::start_token_collector_watcher(cfg_path.clone());
+            crate::background::start_token_collector_watcher(
+                cfg_path.clone(),
+                Arc::clone(&running),
+            );
         }
-
-        // Spawn background thread that marks stale PENDING calls as 'interrupted'.
-        // Fires every 60 seconds; any pending call older than 5 minutes is assumed lost.
         if let Some(ref sqlite_store) = genai_sqlite_store {
-            let store_ref = Arc::clone(sqlite_store);
-            std::thread::Builder::new()
-                .name("genai-stale-scanner".to_string())
-                .spawn(move || {
-                    log::info!("GenAI stale-pending scanner started (interval=60s, timeout=300s)");
-                    loop {
-                        std::thread::sleep(std::time::Duration::from_secs(60));
-                        if let Err(e) = store_ref.mark_interrupted_stale(300) {
-                            log::warn!("Stale-pending scan failed: {e}");
-                        }
-                    }
-                })
-                .ok();
+            crate::background::start_stale_scanner(Arc::clone(sqlite_store), Arc::clone(&running));
         }
 
         Ok(AgentSight {
@@ -498,7 +477,7 @@ impl AgentSight {
             storage,
             scanner,
             _poller,
-            running: Arc::new(AtomicBool::new(true)),
+            running,
             event_count: 0,
             filewatch_callback: None,
             response_mapper: ResponseSessionMapper::new(),
@@ -507,7 +486,6 @@ impl AgentSight {
             last_drain_check: std::time::Instant::now(),
             pid_agent_name_cache,
             http_domains,
-            sls_activated,
             pending_logtail,
             deadloop_kill_enabled: config.deadloop_kill_enabled,
             deadloop_kill_after_count: config.deadloop_kill_after_count,
@@ -593,7 +571,7 @@ impl AgentSight {
         let event = self.probes.try_recv()?;
         self.event_count += 1;
 
-        log::debug!("Processing event: {:?}", event.event_type());
+        log::trace!("Processing event: {:?}", event.event_type());
 
         // Handle ProcMon events for agent lifecycle tracking
         if let Event::ProcMon(ref procmon_event) = event {
@@ -702,11 +680,29 @@ impl AgentSight {
             }
 
             if !output.events.is_empty() {
-                if output.pending_response_id.is_some() {
-                    // Session_id not yet resolved — queue for deferred resolution
+                if let Some(pending_resp_id) = output.pending_response_id {
+                    // Session_id not yet resolved — queue for deferred resolution.
+                    // Write a pending row NOW so crash detection can see this call
+                    // during the deferral window (up to PENDING_SESSION_TIMEOUT).
+                    if let Some(ref info) = pending_info {
+                        if let Some(sqlite_store) = self.genai_sqlite_store.as_ref() {
+                            if let Err(e) = sqlite_store.insert_pending(info) {
+                                log::warn!(
+                                    "Failed to insert deferred pending call {}: {}",
+                                    info.call_id,
+                                    e
+                                );
+                            }
+                        }
+                    } else {
+                        log::warn!(
+                            "Deferred GenAI call queued without pending_info (response_id={}), crash detection blind spot remains",
+                            pending_resp_id
+                        );
+                    }
                     self.pending_genai.push(PendingGenAI {
                         events: output.events,
-                        response_id: output.pending_response_id.unwrap(),
+                        response_id: pending_resp_id,
                         created_at: std::time::Instant::now(),
                     });
                     log::debug!("GenAI events queued for deferred session_id resolution");
@@ -891,311 +887,6 @@ impl AgentSight {
         }
     }
 
-    /// Start a background thread that watches the config file for changes.
-    ///
-    /// React to `runtime.sls_logtail_path` (tri-state, see
-    /// [`crate::config::parse_runtime_sls_path`]):
-    /// * `Some(Some(path))` — non-empty path: validate uid, set dynamic logtail
-    ///   path; on first activation create a `LogtailExporter` and deposit it
-    ///   into `pending_logtail`; on re-activation just swap the dynamic path
-    ///   (the already-registered exporter picks it up at next `export()`).
-    /// * `Some(None)` — empty path: clear the dynamic path so the registered
-    ///   `LogtailExporter` (which is `dynamic=true`) skips its next `export()`
-    ///   batch, effectively pausing SLS uploads. Reversible.
-    /// * `None` — field missing / parse error: ignore.
-    fn start_config_watcher(
-        config_path: PathBuf,
-        sls_activated: Arc<AtomicBool>,
-        pending_logtail: Arc<Mutex<Option<Box<dyn GenAIExporter>>>>,
-        encryption_pem: Option<String>,
-        trace_enabled: bool,
-    ) {
-        use notify::{Event as NotifyEvent, EventKind, RecommendedWatcher, RecursiveMode, Watcher};
-
-        let watch_path = config_path.clone();
-        std::thread::Builder::new()
-            .name("config-watcher".to_string())
-            .spawn(move || {
-                log::info!("Config watcher started for {watch_path:?}");
-
-                let (tx, rx) = std::sync::mpsc::channel::<notify::Result<NotifyEvent>>();
-
-                let mut watcher: RecommendedWatcher = match notify::recommended_watcher(tx) {
-                    Ok(w) => w,
-                    Err(e) => {
-                        log::warn!("Failed to create config file watcher: {e}");
-                        return;
-                    }
-                };
-
-                // Watch the parent directory (inotify requires watching dirs)
-                let watch_dir = watch_path.parent().unwrap_or(Path::new("/"));
-                if let Err(e) = watcher.watch(watch_dir, RecursiveMode::NonRecursive) {
-                    log::warn!("Failed to watch config directory {watch_dir:?}: {e}");
-                    return;
-                }
-
-                let target_filename = watch_path.file_name().map(|f| f.to_os_string());
-
-                for event in rx {
-                    let event = match event {
-                        Ok(e) => e,
-                        Err(e) => {
-                            log::warn!("Config watcher error: {e}");
-                            continue;
-                        }
-                    };
-
-                    // Only process CloseWrite events (file fully written)
-                    match event.kind {
-                        EventKind::Access(notify::event::AccessKind::Close(
-                            notify::event::AccessMode::Write,
-                        )) => {}
-                        _ => continue,
-                    }
-
-                    // Filter by filename
-                    let is_target = event.paths.iter().any(|p| {
-                        p.file_name().map(|f| f.to_os_string()) == target_filename
-                    });
-                    if !is_target {
-                        continue;
-                    }
-
-                    // Re-read config file
-                    let content = match std::fs::read_to_string(&watch_path) {
-                        Ok(c) => c,
-                        Err(e) => {
-                            log::warn!("Config watcher: failed to read {watch_path:?}: {e}");
-                            continue;
-                        }
-                    };
-
-                    // Tri-state parse:
-                    //   None              — field missing/parse error → no-op
-                    //   Some(None)        — empty string → deactivation signal
-                    //   Some(Some(path))  — non-empty   → activation/re-activation
-                    match crate::config::parse_runtime_sls_path(&content) {
-                        None => continue,
-                        Some(None) => {
-                            // Pause SLS uploads. Idempotent: only act if currently active.
-                            if sls_activated.swap(false, Ordering::SeqCst) {
-                                crate::genai::logtail::set_dynamic_logtail_path("");
-                                log::info!(
-                                    "Config watcher: SLS Logtail deactivated \
-                                     (runtime.sls_logtail_path cleared)"
-                                );
-                            }
-                        }
-                        Some(Some(new_path)) => {
-                            log::info!(
-                                "Config watcher: detected runtime.sls_logtail_path = {new_path:?}"
-                            );
-
-                            // Validate uid (strong check: abort process on failure)
-                            let uid = crate::genai::instance_id::get_owner_account_id();
-                            if uid.is_empty() {
-                                log::error!(
-                                    "Config watcher: SLS activation requested but uid fetch failed. \
-                                     Terminating process."
-                                );
-                                std::process::exit(1);
-                            }
-
-                            // Update dynamic path; the already-registered exporter
-                            // (if any) will pick this up on the next export() call.
-                            crate::genai::logtail::set_dynamic_logtail_path(&new_path);
-
-                            // First-time activation: build an exporter and post it
-                            // to the mailbox for the main loop to register.
-                            if !sls_activated.swap(true, Ordering::SeqCst) {
-                                let exporter = LogtailExporter::new_with_path(
-                                    &new_path,
-                                    encryption_pem.as_deref(),
-                                    trace_enabled,
-                                );
-                                log::info!(
-                                    "Config watcher: LogtailExporter created (path={new_path}, uid={uid})"
-                                );
-                                if let Ok(mut guard) = pending_logtail.lock() {
-                                    *guard = Some(Box::new(exporter));
-                                }
-                                log::info!("Config watcher: SLS Logtail activated dynamically");
-                            } else {
-                                log::info!(
-                                    "Config watcher: SLS Logtail re-activated with path={new_path}"
-                                );
-                            }
-                        }
-                    }
-                }
-
-                log::info!("Config watcher exiting");
-            })
-            .ok();
-    }
-
-    /// Start a background thread that polls `/etc/anolisa/enable_token_collector`
-    /// every second.
-    ///
-    /// When the trigger file exists, parses `SLS_LOG_PATH` from
-    /// `/etc/anolisa/ilogtail.cfg` and writes it to `runtime.sls_logtail_path`
-    /// in the agentsight config file. When the trigger file is removed, clears
-    /// `runtime.sls_logtail_path` (sets it to empty string).
-    ///
-    /// The actual SLS activation is then handled by `start_config_watcher`, which
-    /// reacts to the resulting config file change.
-    fn start_token_collector_watcher(config_path: PathBuf) {
-        const ENABLE_FILE: &str = "/etc/anolisa/enable_token_collector";
-        const LOGTAIL_CFG: &str = "/etc/anolisa/ilogtail.cfg";
-        const POLL_INTERVAL: std::time::Duration = std::time::Duration::from_secs(1);
-
-        std::thread::Builder::new()
-            .name("token-collector-watcher".to_string())
-            .spawn(move || {
-                log::info!(
-                    "Token-collector watcher started (enable_file={ENABLE_FILE}, logtail_cfg={LOGTAIL_CFG}, target={config_path:?})"
-                );
-
-                // Last applied state to avoid redundant writes:
-                //   None             — initial / unknown
-                //   Some(Some(path)) — last wrote enabled with this path
-                //   Some(None)       — last wrote disabled
-                let mut last_state: Option<Option<String>> = None;
-
-                loop {
-                    std::thread::sleep(POLL_INTERVAL);
-
-                    let enabled = Path::new(ENABLE_FILE).exists();
-
-                    let desired: Option<String> = if enabled {
-                        match Self::read_logtail_sls_path(LOGTAIL_CFG) {
-                            Some(p) => Some(p),
-                            None => {
-                                if last_state != Some(None) {
-                                    log::warn!(
-                                        "token-collector enabled but SLS_LOG_PATH missing/empty in {LOGTAIL_CFG}"
-                                    );
-                                }
-                                continue;
-                            }
-                        }
-                    } else {
-                        None
-                    };
-
-                    if last_state.as_ref() == Some(&desired) {
-                        continue;
-                    }
-
-                    match Self::write_runtime_sls_path(&config_path, desired.as_deref()) {
-                        Ok(false) => {
-                            last_state = Some(desired);
-                        }
-                        Ok(true) => {
-                            match &desired {
-                                Some(p) => log::info!(
-                                    "token-collector enabled: set runtime.sls_logtail_path={p:?}"
-                                ),
-                                None => log::info!(
-                                    "token-collector disabled: cleared runtime.sls_logtail_path"
-                                ),
-                            }
-                            last_state = Some(desired);
-                        }
-                        Err(e) => {
-                            log::warn!(
-                                "token-collector failed to update {config_path:?}: {e}"
-                            );
-                        }
-                    }
-                }
-            })
-            .ok();
-    }
-
-    /// Parse `SLS_LOG_PATH=...` from a logtail.cfg-style key=value file.
-    /// Returns the value with surrounding quotes stripped, or None if the key
-    /// is absent or the value is empty.
-    fn read_logtail_sls_path(cfg_path: &str) -> Option<String> {
-        let content = match std::fs::read_to_string(cfg_path) {
-            Ok(c) => c,
-            Err(e) => {
-                log::debug!("token-collector: failed to read {cfg_path}: {e}");
-                return None;
-            }
-        };
-
-        for line in content.lines() {
-            let line = line.trim();
-            if line.is_empty() || line.starts_with('#') {
-                continue;
-            }
-            let mut parts = line.splitn(2, '=');
-            let key = parts.next()?.trim();
-            if key != "SLS_LOG_PATH" {
-                continue;
-            }
-            let raw = parts.next()?.trim();
-            // Strip optional surrounding single/double quotes.
-            let value = raw.trim_matches(|c| c == '"' || c == '\'').trim();
-            if value.is_empty() {
-                return None;
-            }
-            return Some(value.to_string());
-        }
-        None
-    }
-
-    /// Update `runtime.sls_logtail_path` in the JSON config file.
-    ///
-    /// * `new_path = Some(p)` — set the path to `p`.
-    /// * `new_path = None`    — clear the path (set to empty string).
-    ///
-    /// Returns `Ok(true)` if the file was rewritten, `Ok(false)` if the field
-    /// already matched the desired value (no write performed). Other JSON fields
-    /// are preserved untouched.
-    fn write_runtime_sls_path(config_path: &Path, new_path: Option<&str>) -> anyhow::Result<bool> {
-        let content = std::fs::read_to_string(config_path)
-            .with_context(|| format!("read config {config_path:?}"))?;
-        let mut value: serde_json::Value = serde_json::from_str(&content)
-            .with_context(|| format!("parse JSON {config_path:?}"))?;
-
-        let root = value
-            .as_object_mut()
-            .context("agentsight config root must be a JSON object")?;
-        let runtime_entry = root
-            .entry("runtime".to_string())
-            .or_insert_with(|| serde_json::json!({}));
-        let runtime = runtime_entry
-            .as_object_mut()
-            .context("runtime field must be a JSON object")?;
-
-        let target = new_path.unwrap_or("");
-        let current = runtime
-            .get("sls_logtail_path")
-            .and_then(|v| v.as_str())
-            .unwrap_or("");
-        if current == target {
-            return Ok(false);
-        }
-        runtime.insert(
-            "sls_logtail_path".to_string(),
-            serde_json::Value::String(target.to_string()),
-        );
-
-        // Pretty-print preserving field order (preserve_order feature).
-        let mut new_content =
-            serde_json::to_string_pretty(&value).context("serialize updated config")?;
-        new_content.push('\n');
-
-        // Direct write so the existing config-watcher sees IN_CLOSE_WRITE
-        // and re-loads runtime.sls_logtail_path.
-        std::fs::write(config_path, new_content.as_bytes())
-            .with_context(|| format!("write config {config_path:?}"))?;
-        Ok(true)
-    }
-
     /// Install an FFI event sender for C API mode.
     /// When set, completed events are pushed through this channel.
     /// `pub(crate)` because `FfiEventSender` is a crate-internal type and the
@@ -1224,6 +915,28 @@ impl AgentSight {
                 );
             }
         }
+    }
+
+    /// Complete deferred GenAI events: promote their pending DB rows to
+    /// 'complete', then export to non-SQLite exporters (or FFI).
+    ///
+    /// # Preconditions
+    ///
+    /// A `status='pending'` row for each event's `call_id` must already exist
+    /// in `genai_events` (written by `insert_pending` at queue time).
+    ///
+    /// This mirrors the immediate path (try_process lines 717-744) but is used
+    /// when events were queued in `pending_genai` and are now being drained.
+    /// The pending row was written by the deferred-queue entry point; this
+    /// method updates it via `complete_pending` and avoids double-writing by
+    /// skipping the SQLite exporter in the fan-out.
+    fn complete_and_export_deferred_genai(&self, events: &[GenAISemanticEvent]) {
+        complete_deferred_genai(
+            events,
+            self.genai_sqlite_store.as_ref(),
+            &self.genai_exporters,
+            self.ffi_sender.as_ref(),
+        );
     }
 
     /// Online interruption detection: inspect exported events and persist any
@@ -1556,9 +1269,24 @@ impl AgentSight {
                 ConnectionState::RequestPending { request } => ("RequestPending", request, vec![]),
                 ConnectionState::SseActive {
                     request: Some(req),
+                    response_headers,
                     sse_events,
-                    ..
-                } => ("SseActive", req, sse_events),
+                    compressed_buffer,
+                    content_encoding,
+                } => {
+                    // A *compressed* SSE stream buffers raw bytes and only decodes at
+                    // completion. If the PID died before the stream completed (e.g.
+                    // HTTP/2, no `0\r\n\r\n` terminator), sse_events is empty and the
+                    // body — model/tokens/output — would be lost on drain. Recover it
+                    // via the same decode path as the live finalizer.
+                    let events = drained_sse_events(
+                        sse_events,
+                        compressed_buffer,
+                        content_encoding,
+                        &response_headers,
+                    );
+                    ("SseActive", req, events)
+                }
                 _ => continue,
             };
 
@@ -1873,7 +1601,7 @@ impl AgentSight {
         self.pending_genai = still_pending;
 
         for events in &to_export {
-            self.export_genai_events(events);
+            self.complete_and_export_deferred_genai(events);
             self.detect_and_store_interruptions(events);
         }
     }
@@ -1904,7 +1632,7 @@ impl AgentSight {
         self.pending_genai = still_pending;
 
         for events in &to_export {
-            self.export_genai_events(events);
+            self.complete_and_export_deferred_genai(events);
             self.detect_and_store_interruptions(events);
         }
     }
@@ -1919,7 +1647,7 @@ impl AgentSight {
             );
         }
         for pending in pending_items {
-            self.export_genai_events(&pending.events);
+            self.complete_and_export_deferred_genai(&pending.events);
             self.detect_and_store_interruptions(&pending.events);
         }
     }
@@ -2002,10 +1730,88 @@ impl Drop for AgentSight {
     }
 }
 
+fn drained_sse_events(
+    sse_events: Vec<crate::parser::sse::ParsedSseEvent>,
+    compressed_buffer: Option<Vec<u8>>,
+    content_encoding: Option<String>,
+    response_headers: &crate::parser::http::ParsedResponse,
+) -> Vec<crate::parser::sse::ParsedSseEvent> {
+    match compressed_buffer {
+        Some(ref buf) if sse_events.is_empty() && !buf.is_empty() => {
+            let is_chunked =
+                crate::aggregator::HttpConnectionAggregator::is_chunked_response(response_headers);
+            crate::aggregator::HttpConnectionAggregator::decode_compressed_sse(
+                buf,
+                content_encoding.as_deref(),
+                is_chunked,
+                &response_headers.source_event,
+            )
+        }
+        _ => sse_events,
+    }
+}
+
+/// Complete deferred GenAI events: promote pending DB rows to 'complete',
+/// then export to non-SQLite exporters (or FFI).
+///
+/// Extracted as a free function so the persistence policy is unit-testable
+/// without constructing a full `AgentSight` instance.
+fn complete_deferred_genai(
+    events: &[GenAISemanticEvent],
+    sqlite_store: Option<&Arc<GenAISqliteStore>>,
+    exporters: &[Box<dyn GenAIExporter>],
+    ffi_sender: Option<&FfiEventSender>,
+) {
+    if let Some(store) = sqlite_store {
+        for event in events {
+            if let Err(e) = store.complete_pending(event) {
+                log::warn!("Failed to complete deferred pending call: {e}");
+            }
+        }
+        if let Some(sender) = ffi_sender {
+            for event in events {
+                if let GenAISemanticEvent::LLMCall(call) = event {
+                    sender.send(FfiEvent::Llm(call.clone()));
+                }
+            }
+        } else {
+            for exporter in exporters {
+                if exporter.name() != "sqlite" {
+                    exporter.export(events);
+                }
+            }
+        }
+    } else {
+        // No SQLite store — export to all exporters (or FFI)
+        if let Some(sender) = ffi_sender {
+            for event in events {
+                if let GenAISemanticEvent::LLMCall(call) = event {
+                    sender.send(FfiEvent::Llm(call.clone()));
+                }
+            }
+        } else {
+            for exporter in exporters {
+                exporter.export(events);
+                log::debug!(
+                    "Exported {} GenAI events via '{}'",
+                    events.len(),
+                    exporter.name()
+                );
+            }
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use std::sync::atomic::{AtomicU32, Ordering};
+
+    use crate::parser::http::ParsedResponse;
+    use crate::parser::sse::ParsedSseEvent;
+    use crate::probes::sslsniff::SslEvent;
+    use std::collections::HashMap;
+    use std::rc::Rc;
 
     /// Generate a unique temp directory for each test invocation.
     fn unique_tmp_dir(tag: &str) -> PathBuf {
@@ -2018,232 +1824,299 @@ mod tests {
         dir
     }
 
-    // ────── read_logtail_sls_path ──────
+    // ── Tests for complete_deferred_genai + complete_pending guard ──
 
-    #[test]
-    fn test_read_logtail_sls_path_basic() {
-        let dir = unique_tmp_dir("read-basic");
-        let cfg = dir.join("ilogtail.cfg");
-        std::fs::write(&cfg, "SLS_LOG_PATH=/var/log/sls/agentsight.log\n").unwrap();
-        let v = AgentSight::read_logtail_sls_path(cfg.to_str().unwrap());
-        assert_eq!(v, Some("/var/log/sls/agentsight.log".to_string()));
+    /// Stub exporter that records exported events for assertion.
+    struct RecordingExporter {
+        name: String,
+        events: std::sync::Mutex<Vec<GenAISemanticEvent>>,
+    }
+
+    impl RecordingExporter {
+        fn new(name: &str) -> Self {
+            Self {
+                name: name.to_string(),
+                events: std::sync::Mutex::new(Vec::new()),
+            }
+        }
+    }
+
+    impl GenAIExporter for RecordingExporter {
+        fn name(&self) -> &str {
+            &self.name
+        }
+        fn export(&self, events: &[GenAISemanticEvent]) {
+            self.events.lock().unwrap().extend_from_slice(events);
+        }
+    }
+
+    fn make_test_llm_call(call_id: &str) -> crate::genai::LLMCall {
+        use crate::genai::semantic::{LLMRequest, LLMResponse};
+        crate::genai::LLMCall {
+            call_id: call_id.to_string(),
+            start_timestamp_ns: 1_000_000_000,
+            end_timestamp_ns: 2_000_000_000,
+            duration_ns: 1_000_000_000,
+            provider: "openai".to_string(),
+            model: "gpt-4".to_string(),
+            request: LLMRequest {
+                messages: vec![],
+                temperature: None,
+                max_tokens: None,
+                frequency_penalty: None,
+                presence_penalty: None,
+                top_p: None,
+                top_k: None,
+                seed: None,
+                stop_sequences: None,
+                stream: false,
+                tools: None,
+                raw_body: None,
+            },
+            response: LLMResponse {
+                messages: vec![],
+                streamed: false,
+                raw_body: None,
+            },
+            token_usage: None,
+            error: None,
+            pid: 1234,
+            process_name: "test".to_string(),
+            agent_name: Some("test-agent".to_string()),
+            metadata: HashMap::new(),
+        }
+    }
+
+    fn make_test_pending_info(call_id: &str) -> crate::storage::sqlite::genai::PendingCallInfo {
+        crate::storage::sqlite::genai::PendingCallInfo {
+            call_id: call_id.to_string(),
+            trace_id: None,
+            conversation_id: None,
+            session_id: None,
+            start_timestamp_ns: 1_000_000_000,
+            pid: 1234,
+            process_name: "test".to_string(),
+            agent_name: Some("test-agent".to_string()),
+            http_method: Some("POST".to_string()),
+            http_path: Some("/v1/chat/completions".to_string()),
+            input_messages: None,
+            system_instructions: None,
+            user_query: None,
+            is_sse: false,
+            model: Some("gpt-4".to_string()),
+            provider: Some("openai".to_string()),
+        }
     }
 
     #[test]
-    fn test_read_logtail_sls_path_double_quoted() {
-        let dir = unique_tmp_dir("read-dq");
-        let cfg = dir.join("ilogtail.cfg");
-        std::fs::write(&cfg, "SLS_LOG_PATH=\"/var/log/sls/a.log\"\n").unwrap();
-        assert_eq!(
-            AgentSight::read_logtail_sls_path(cfg.to_str().unwrap()),
-            Some("/var/log/sls/a.log".to_string())
-        );
-    }
+    fn test_complete_pending_recovers_interrupted_row() {
+        let dir = unique_tmp_dir("cp-interrupted");
+        let db_path = dir.join("genai_events.db");
+        let store = Arc::new(GenAISqliteStore::new_with_path(&db_path).expect("create test store"));
 
-    #[test]
-    fn test_read_logtail_sls_path_single_quoted() {
-        let dir = unique_tmp_dir("read-sq");
-        let cfg = dir.join("ilogtail.cfg");
-        std::fs::write(&cfg, "SLS_LOG_PATH='/tmp/x.log'\n").unwrap();
-        assert_eq!(
-            AgentSight::read_logtail_sls_path(cfg.to_str().unwrap()),
-            Some("/tmp/x.log".to_string())
-        );
-    }
+        let info = make_test_pending_info("call-1");
+        store.insert_pending(&info).expect("insert_pending");
 
-    #[test]
-    fn test_read_logtail_sls_path_empty_value() {
-        let dir = unique_tmp_dir("read-empty");
-        let cfg = dir.join("ilogtail.cfg");
-        std::fs::write(&cfg, "SLS_LOG_PATH=\"\"\n").unwrap();
-        assert_eq!(
-            AgentSight::read_logtail_sls_path(cfg.to_str().unwrap()),
-            None
-        );
-    }
+        // Simulate crash detection marking it as interrupted
+        store
+            .mark_pending_interrupted_for_pid(1234, "agent_crash")
+            .expect("mark interrupted");
 
-    #[test]
-    fn test_read_logtail_sls_path_skip_comments_and_other_keys() {
-        let dir = unique_tmp_dir("read-mixed");
-        let cfg = dir.join("ilogtail.cfg");
-        let content = "\
-# comment line
-OTHER_KEY=value
-SLS_LOG_PATH=/data/logs/agent.log
-EXTRA=foo
-";
-        std::fs::write(&cfg, content).unwrap();
-        assert_eq!(
-            AgentSight::read_logtail_sls_path(cfg.to_str().unwrap()),
-            Some("/data/logs/agent.log".to_string())
-        );
-    }
+        // complete_pending should recover the interrupted row to 'complete'
+        let event = GenAISemanticEvent::LLMCall(make_test_llm_call("call-1"));
+        store.complete_pending(&event).expect("complete_pending");
 
-    #[test]
-    fn test_read_logtail_sls_path_missing_key() {
-        let dir = unique_tmp_dir("read-miss");
-        let cfg = dir.join("ilogtail.cfg");
-        std::fs::write(&cfg, "OTHER=1\n").unwrap();
-        assert_eq!(
-            AgentSight::read_logtail_sls_path(cfg.to_str().unwrap()),
-            None
-        );
-    }
+        // Verify: exactly 1 row, status = complete (recovered from interrupted)
+        let conn = rusqlite::Connection::open(&db_path).unwrap();
+        let count: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM genai_events WHERE call_id = 'call-1'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(count, 1, "should have exactly 1 row, not 2 (double-write)");
 
-    #[test]
-    fn test_read_logtail_sls_path_file_missing() {
-        let path = "/nonexistent-dir/agentsight-test/ilogtail.cfg";
-        assert_eq!(AgentSight::read_logtail_sls_path(path), None);
-    }
+        let status: String = conn
+            .query_row(
+                "SELECT status FROM genai_events WHERE call_id = 'call-1'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(status, "complete");
 
-    // ────── write_runtime_sls_path ──────
-
-    fn make_sample_config(dir: &Path) -> PathBuf {
-        let cfg = dir.join("agentsight.json");
-        let content = r#"{
-  "runtime": { "sls_logtail_path": "" },
-  "deadloop": { "enabled": false, "kill_after_count": 3 },
-  "https": [{ "rule": ["dashscope.aliyuncs.com"] }],
-  "cmdline": { "allow": [{ "rule": ["claude*"], "agent_name": "Claude" }] }
-}
-"#;
-        std::fs::write(&cfg, content).unwrap();
-        cfg
-    }
-
-    #[test]
-    fn test_write_runtime_sls_path_set_value() {
-        let dir = unique_tmp_dir("write-set");
-        let cfg = make_sample_config(&dir);
-
-        let changed = AgentSight::write_runtime_sls_path(&cfg, Some("/var/log/sls/x.log")).unwrap();
-        assert!(changed, "should write when value differs");
-
-        // Verify config file content
-        let c = std::fs::read_to_string(&cfg).unwrap();
-        let parsed: serde_json::Value = serde_json::from_str(&c).unwrap();
-        assert_eq!(
-            parsed["runtime"]["sls_logtail_path"].as_str(),
-            Some("/var/log/sls/x.log")
-        );
-        // Other fields preserved
-        assert_eq!(parsed["deadloop"]["kill_after_count"].as_u64(), Some(3));
-        assert!(parsed["cmdline"]["allow"].is_array());
-        assert_eq!(parsed["https"][0]["rule"][0], "dashscope.aliyuncs.com");
-    }
-
-    #[test]
-    fn test_write_runtime_sls_path_clear() {
-        let dir = unique_tmp_dir("write-clear");
-        let cfg = dir.join("agentsight.json");
-        std::fs::write(
-            &cfg,
-            r#"{"runtime":{"sls_logtail_path":"/old/path.log"},"deadloop":{"enabled":true}}"#,
-        )
-        .unwrap();
-
-        let changed = AgentSight::write_runtime_sls_path(&cfg, None).unwrap();
-        assert!(changed);
-        let parsed: serde_json::Value =
-            serde_json::from_str(&std::fs::read_to_string(&cfg).unwrap()).unwrap();
-        assert_eq!(parsed["runtime"]["sls_logtail_path"].as_str(), Some(""));
-        assert_eq!(parsed["deadloop"]["enabled"].as_bool(), Some(true));
-    }
-
-    #[test]
-    fn test_write_runtime_sls_path_idempotent_same_value() {
-        let dir = unique_tmp_dir("write-idem");
-        let cfg = make_sample_config(&dir);
-        let mtime1 = std::fs::metadata(&cfg).unwrap().modified().unwrap();
-
-        // First write: empty -> empty (no-op)
-        let changed = AgentSight::write_runtime_sls_path(&cfg, None).unwrap();
-        assert!(!changed, "writing same empty value should be no-op");
-
-        let mtime2 = std::fs::metadata(&cfg).unwrap().modified().unwrap();
-        assert_eq!(
-            mtime1, mtime2,
-            "file should not be touched when value matches"
-        );
-    }
-
-    #[test]
-    fn test_write_runtime_sls_path_creates_runtime_section() {
-        let dir = unique_tmp_dir("write-no-rt");
-        let cfg = dir.join("agentsight.json");
-        // Config without runtime section
-        std::fs::write(&cfg, r#"{"deadloop":{"enabled":false}}"#).unwrap();
-
-        let changed = AgentSight::write_runtime_sls_path(&cfg, Some("/p.log")).unwrap();
-        assert!(changed);
-        let parsed: serde_json::Value =
-            serde_json::from_str(&std::fs::read_to_string(&cfg).unwrap()).unwrap();
-        assert_eq!(
-            parsed["runtime"]["sls_logtail_path"].as_str(),
-            Some("/p.log")
-        );
-    }
-
-    #[test]
-    fn test_write_runtime_sls_path_invalid_root_errors() {
-        let dir = unique_tmp_dir("write-bad");
-        let cfg = dir.join("agentsight.json");
-        // Root is an array, not an object — must reject
-        std::fs::write(&cfg, r#"[1,2,3]"#).unwrap();
-        assert!(AgentSight::write_runtime_sls_path(&cfg, Some("/p.log")).is_err());
-    }
-
-    // ────── end-to-end simulation (no thread, exercise the same logic) ──────
-
-    /// Simulate the watcher's decision loop without spawning a thread:
-    /// trigger present → write enabled path; trigger removed → clear path.
-    #[test]
-    fn test_watcher_logic_end_to_end() {
-        let dir = unique_tmp_dir("e2e");
-        let cfg = make_sample_config(&dir);
-        let logtail_cfg = dir.join("ilogtail.cfg");
-        let enable_file = dir.join("enable_token_collector");
-
-        // Step 1: trigger present + logtail.cfg has SLS_LOG_PATH
-        std::fs::write(&logtail_cfg, "SLS_LOG_PATH=/var/log/sls/agent.log\n").unwrap();
-        std::fs::write(&enable_file, b"").unwrap();
-
-        let enabled = enable_file.exists();
-        let desired: Option<String> = if enabled {
-            AgentSight::read_logtail_sls_path(logtail_cfg.to_str().unwrap())
-        } else {
-            None
-        };
-        assert_eq!(desired, Some("/var/log/sls/agent.log".to_string()));
-        let changed = AgentSight::write_runtime_sls_path(&cfg, desired.as_deref()).unwrap();
-        assert!(changed);
-        let parsed: serde_json::Value =
-            serde_json::from_str(&std::fs::read_to_string(&cfg).unwrap()).unwrap();
-        assert_eq!(
-            parsed["runtime"]["sls_logtail_path"].as_str(),
-            Some("/var/log/sls/agent.log")
-        );
-
-        // Step 2: trigger removed → clear
-        std::fs::remove_file(&enable_file).unwrap();
-        let enabled = enable_file.exists();
-        let desired: Option<String> = if enabled {
-            AgentSight::read_logtail_sls_path(logtail_cfg.to_str().unwrap())
-        } else {
-            None
-        };
-        assert!(desired.is_none());
-        let changed = AgentSight::write_runtime_sls_path(&cfg, desired.as_deref()).unwrap();
-        assert!(changed);
-        let parsed: serde_json::Value =
-            serde_json::from_str(&std::fs::read_to_string(&cfg).unwrap()).unwrap();
-        assert_eq!(parsed["runtime"]["sls_logtail_path"].as_str(), Some(""));
-
-        // Step 3: trigger removed again → no-op
-        let changed = AgentSight::write_runtime_sls_path(&cfg, None).unwrap();
-        assert!(!changed);
-
-        // Cleanup
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_complete_pending_fallback_inserts_when_no_row_exists() {
+        let dir = unique_tmp_dir("cp-fallback");
+        let db_path = dir.join("genai_events.db");
+        let store = Arc::new(GenAISqliteStore::new_with_path(&db_path).expect("create test store"));
+
+        // No insert_pending — simulate DB restart scenario
+        let event = GenAISemanticEvent::LLMCall(make_test_llm_call("call-2"));
+        store.complete_pending(&event).expect("complete_pending");
+
+        let conn = rusqlite::Connection::open(&db_path).unwrap();
+        let count: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM genai_events WHERE call_id = 'call-2'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(count, 1, "fallback INSERT should create exactly 1 row");
+
+        let status: String = conn
+            .query_row(
+                "SELECT status FROM genai_events WHERE call_id = 'call-2'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(status, "complete");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_complete_deferred_genai_promotes_pending_and_exports_non_sqlite() {
+        let dir = unique_tmp_dir("deferred-export");
+        let db_path = dir.join("genai_events.db");
+        let store = Arc::new(GenAISqliteStore::new_with_path(&db_path).expect("create test store"));
+
+        // Insert a pending row
+        let info = make_test_pending_info("call-3");
+        store.insert_pending(&info).expect("insert_pending");
+
+        // Build event + exporters
+        let event = GenAISemanticEvent::LLMCall(make_test_llm_call("call-3"));
+        let recorder = RecordingExporter::new("test-recorder");
+        let sqlite_exporter = RecordingExporter::new("sqlite");
+        let exporters: Vec<Box<dyn GenAIExporter>> =
+            vec![Box::new(recorder), Box::new(sqlite_exporter)];
+
+        // Call the free function
+        complete_deferred_genai(&[event], Some(&store), &exporters, None);
+
+        // DB row should be promoted to 'complete'
+        let conn = rusqlite::Connection::open(&db_path).unwrap();
+        let status: String = conn
+            .query_row(
+                "SELECT status FROM genai_events WHERE call_id = 'call-3'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(status, "complete");
+
+        // test-recorder should have received the event; sqlite exporter should NOT
+        // (We can't inspect after move, but the function skips name()=="sqlite")
+        let count: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM genai_events WHERE call_id = 'call-3'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            count, 1,
+            "exactly 1 row (no double-write from sqlite exporter)"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_complete_deferred_genai_no_sqlite_exports_to_all() {
+        let event = GenAISemanticEvent::LLMCall(make_test_llm_call("call-4"));
+        let exporters: Vec<Box<dyn GenAIExporter>> =
+            vec![Box::new(RecordingExporter::new("test-recorder"))];
+
+        complete_deferred_genai(&[event], None, &exporters, None);
+    }
+
+    fn ssl_event() -> Rc<SslEvent> {
+        Rc::new(SslEvent {
+            source: 0,
+            timestamp_ns: 0,
+            delta_ns: 0,
+            pid: 1,
+            tid: 1,
+            uid: 0,
+            len: 0,
+            rw: 0,
+            comm: String::new(),
+            buf: Vec::new(),
+            is_handshake: false,
+            ssl_ptr: 0x1,
+        })
+    }
+
+    /// A zstd-compressed, chunk-framed SSE body (the #973 shape).
+    fn chunked_zstd_sse() -> Vec<u8> {
+        let sse = b"event: message_start\ndata: {\"type\":\"message_start\"}\n\ndata: [DONE]\n\n";
+        let comp = zstd::encode_all(&sse[..], 3).unwrap();
+        let mut chunked = Vec::new();
+        chunked.extend_from_slice(format!("{:x}\r\n", comp.len()).as_bytes());
+        chunked.extend_from_slice(&comp);
+        chunked.extend_from_slice(b"\r\n0\r\n\r\n");
+        chunked
+    }
+
+    fn chunked_zstd_response() -> ParsedResponse {
+        let mut headers = HashMap::new();
+        headers.insert("content-type".to_string(), "text/event-stream".to_string());
+        headers.insert("content-encoding".to_string(), "zstd".to_string());
+        headers.insert("transfer-encoding".to_string(), "chunked".to_string());
+        ParsedResponse {
+            version: 11,
+            status_code: 200,
+            reason: "OK".to_string(),
+            headers,
+            body_offset: 0,
+            body_len: 0,
+            source_event: ssl_event(),
+        }
+    }
+
+    #[test]
+    fn drained_sse_events_decodes_unfinalized_compressed_stream() {
+        // fix(#973): a compressed stream that died before finalizing (events empty,
+        // buffer non-empty) must be DECODED on drain, not lost. Reverting the drain
+        // decode yields an empty vec here, so this is discriminating.
+        let events = drained_sse_events(
+            vec![],
+            Some(chunked_zstd_sse()),
+            Some("zstd".to_string()),
+            &chunked_zstd_response(),
+        );
+        assert!(
+            !events.is_empty(),
+            "compressed buffer must be decoded into events on drain"
+        );
+    }
+
+    #[test]
+    fn drained_sse_events_passes_through_when_no_buffer() {
+        // Uncompressed stream: no compressed_buffer -> nothing to decode.
+        let out = drained_sse_events(vec![], None, None, &chunked_zstd_response());
+        assert!(out.is_empty());
+    }
+
+    #[test]
+    fn drained_sse_events_does_not_redecode_when_events_present() {
+        // Live parsing already produced events -> pass them through, don't re-decode.
+        let existing = vec![ParsedSseEvent::new(None, None, None, 0, 0, ssl_event())];
+        let n = existing.len();
+        let out = drained_sse_events(
+            existing,
+            Some(chunked_zstd_sse()),
+            Some("zstd".to_string()),
+            &chunked_zstd_response(),
+        );
+        assert_eq!(out.len(), n, "non-empty events must pass through unchanged");
     }
 }

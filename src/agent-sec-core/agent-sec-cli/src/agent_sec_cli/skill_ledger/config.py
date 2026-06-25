@@ -5,6 +5,24 @@ import logging
 from pathlib import Path
 from typing import Any
 
+from agent_sec_cli.skill_ledger.activation_policy import (
+    ACTIVATION_POLICIES as ACTIVATION_POLICIES,
+)
+from agent_sec_cli.skill_ledger.activation_policy import (
+    ACTIVATION_POLICY_LATEST_SCANNED as ACTIVATION_POLICY_LATEST_SCANNED,
+)
+from agent_sec_cli.skill_ledger.activation_policy import (
+    ACTIVATION_POLICY_PASS_ONLY as ACTIVATION_POLICY_PASS_ONLY,
+)
+from agent_sec_cli.skill_ledger.activation_policy import (
+    ACTIVATION_POLICY_PASS_WARN_ONLY as ACTIVATION_POLICY_PASS_WARN_ONLY,
+)
+from agent_sec_cli.skill_ledger.activation_policy import (
+    DEFAULT_ACTIVATION_POLICY as DEFAULT_ACTIVATION_POLICY,
+)
+from agent_sec_cli.skill_ledger.activation_policy import (
+    validate_activation_policy,
+)
 from agent_sec_cli.skill_ledger.errors import ConfigError
 from agent_sec_cli.skill_ledger.paths import get_config_dir
 from agent_sec_cli.skill_ledger.scanner.names import (
@@ -29,6 +47,7 @@ _IGNORED_RECURSIVE_DIRS = frozenset(
 
 _DEFAULT_CONFIG: dict[str, Any] = {
     "signingBackend": "ed25519",
+    "activationPolicy": DEFAULT_ACTIVATION_POLICY,
     "enableDefaultSkillDirs": True,
     "managedSkillDirs": [],
     # ── Scanner / parser registry (see design doc §2) ──
@@ -148,6 +167,17 @@ def load_config() -> dict[str, Any]:
         return _deep_merge_config(_DEFAULT_CONFIG, cfg)
     except json.JSONDecodeError as exc:
         raise ConfigError(f"Invalid JSON in {path}: {exc}") from exc
+
+
+def resolve_activation_policy(config: dict[str, Any] | None = None) -> str:
+    """Return the configured activation policy."""
+    if config is None:
+        config = load_config()
+    policy = config.get("activationPolicy", DEFAULT_ACTIVATION_POLICY)
+    try:
+        return validate_activation_policy(policy)
+    except ValueError as exc:
+        raise ConfigError(f"Invalid activationPolicy: {exc}") from exc
 
 
 def resolve_skill_dirs(config: dict[str, Any] | None = None) -> list[Path]:

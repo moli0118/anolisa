@@ -14,11 +14,13 @@ Tool surface mirrors the OpenClaw plugin (`ws-ckpt-*`):
 from __future__ import annotations
 
 import json
+import os
 import shutil
 import subprocess
 from typing import Any, Dict, Optional, Tuple
 
 from .config import load_config
+from .checkpoint_manager import cwd_inside_workspace, cwd_inside_workspace_reason, get_manager
 
 
 # Cached once per process: ws-ckpt is a system-installed binary, so a path
@@ -31,24 +33,12 @@ _ws_ckpt_available: Optional[bool] = None
 # ---------------------------------------------------------------------------
 
 
-def _get_default_workspace() -> str:
-    """Resolve workspace via the singleton manager's config.
-
-    Reads from the same in-memory state hooks use, so an
-    `ws-ckpt-config update workspace` takes effect immediately and isn't
-    shadowed by a stale env var on the next tool call.
-    """
-    from . import _get_manager  # lazy: __init__ imports tools
-
-    return _get_manager().config.workspace
-
-
 _NO_WORKSPACE_MSG = "No workspace configured. Tell me the workspace path and I'll set it up."
 
 
 def _require_workspace() -> Tuple[str, Optional[str]]:
     """Resolve and validate workspace. Returns (workspace, None) or ("", error_json)."""
-    ws = _get_default_workspace()
+    ws = get_manager().config.workspace
     if not ws:
         return "", _err(_NO_WORKSPACE_MSG)
     return ws, None
@@ -56,13 +46,11 @@ def _require_workspace() -> Tuple[str, Optional[str]]:
 
 def _reject_if_cwd_inside_workspace(workspace: str) -> Optional[str]:
     """Return a serialized error response when cwd is inside workspace, else None."""
-    from . import _cwd_inside_workspace, _cwd_inside_workspace_reason  # lazy
-
-    inside, cwd = _cwd_inside_workspace(workspace)
+    inside, cwd = cwd_inside_workspace(workspace)
     if inside:
         return _json({
             "success": False,
-            "error": _cwd_inside_workspace_reason(cwd, workspace),
+            "error": cwd_inside_workspace_reason(cwd, workspace),
             "retryable": False,
         })
     return None
@@ -71,7 +59,10 @@ def _reject_if_cwd_inside_workspace(workspace: str) -> Optional[str]:
 def _run_ws_ckpt_cmd(cmd: list) -> Tuple[bool, str]:
     """Execute a ws-ckpt CLI command and return (success, output)."""
     try:
-        result = subprocess.run(cmd, capture_output=True, text=True, timeout=30)
+        result = subprocess.run(
+            cmd, capture_output=True, text=True, timeout=30,
+            env={**os.environ, "WS_CKPT_AGENT_NAME": "hermes"},
+        )
         return result.returncode == 0, result.stdout.strip() or result.stderr.strip()
     except subprocess.TimeoutExpired:
         return False, "Command timed out (30s)"
@@ -209,6 +200,11 @@ WS_CKPT_CONFIG_SCHEMA: Dict[str, Any] = {
         "workspace (default workspace absolute path; used by every command without -w. "
         "If the path is a symlink, use the link itself — do NOT replace it with the "
         "resolved real path; the daemon registers and matches by the exact string you pass), "
+        "cronSchedules (scheduled cron snapshots using standard 5-field cron expressions; "
+        "value format: 'add \"CRON_EXPR\"', 'remove \"CRON_EXPR\"', or 'set [\"CRON_EXPR\"]'; "
+        "operates on the current workspace; "
+        "if the user's scheduling intent cannot be exactly expressed as a cron expression, "
+        "do NOT write an approximate/degraded schedule — present the closest option and await confirmation), "
         "maxSnapshotsNum (number of snapshots to keep when auto-cleanup is by count), "
         "maxSnapshotsDuration (duration to keep when auto-cleanup is by time, e.g. \"7d\"/\"24h\"). "
         "Only update the specific key requested by the user."
@@ -224,7 +220,7 @@ WS_CKPT_CONFIG_SCHEMA: Dict[str, Any] = {
                 "type": "string",
                 "description": (
                     "Config key to update: autoCheckpoint, workspace, "
-                    "maxSnapshotsNum, maxSnapshotsDuration"
+                    "cronSchedules, maxSnapshotsNum, maxSnapshotsDuration"
                 ),
             },
             "value": {
@@ -233,6 +229,7 @@ WS_CKPT_CONFIG_SCHEMA: Dict[str, Any] = {
                     "New value as a string. Formats: "
                     "autoCheckpoint = \"true\"/\"false\"; "
                     "workspace = absolute path; "
+                    "cronSchedules = 'add \"CRON_EXPR\"' / 'remove \"CRON_EXPR\"' / 'set [\"CRON_EXPR\"]'; "
                     "maxSnapshotsNum = positive integer (or \"unset\" to restore inherit-global); "
                     "maxSnapshotsDuration = e.g. \"7d\"/\"24h\" (or \"unset\" to restore inherit-global)."
                 ),
@@ -277,15 +274,27 @@ WS_CKPT_CHECKPOINT_SCHEMA: Dict[str, Any] = {
 WS_CKPT_ROLLBACK_SCHEMA: Dict[str, Any] = {
     "name": "ws-ckpt-rollback",
     "description": (
-        "Roll back the workspace to a specific checkpoint. Use ws-ckpt-list "
-        "first to see available snapshots."
+        "Preview or roll back the workspace to a specific checkpoint or N ancestors back. "
+        "Set preview=true to inspect file changes without modifying the workspace. "
+        "Use ws-ckpt-list first to see available snapshots."
     ),
     "parameters": {
         "type": "object",
         "properties": {
             "target": {
                 "type": "string",
-                "description": "Snapshot id to roll back to.",
+                "description": (
+                    "Snapshot id to roll back to (mutually exclusive with "
+                    "num_ancestors)."
+                ),
+            },
+            "num_ancestors": {
+                "type": "integer",
+                "description": (
+                    "Number of steps to go back "
+                    "(>=1, mutually exclusive with target). "
+                    "1 = undo last turn, 2 = undo last two turns."
+                ),
             },
             "workspace": {
                 "type": "string",
@@ -295,8 +304,13 @@ WS_CKPT_ROLLBACK_SCHEMA: Dict[str, Any] = {
                     "link itself — do NOT replace it with the resolved real path."
                 ),
             },
+            "preview": {
+                "type": "boolean",
+                "description": (
+                    "Optional: preview the file changes without modifying the workspace."
+                ),
+            },
         },
-        "required": ["target"],
         "additionalProperties": False,
     },
 }
@@ -317,9 +331,10 @@ WS_CKPT_LIST_SCHEMA: Dict[str, Any] = {
 WS_CKPT_DIFF_SCHEMA: Dict[str, Any] = {
     "name": "ws-ckpt-diff",
     "description": (
-        "Compare file changes between two snapshots. Always display the "
-        "FULL untruncated result to the user. Do NOT re-interpret or "
-        "contradict the tool output."
+        "Compare file changes between two snapshots, or between a snapshot "
+        "and the current workspace state. Omit 'to' to diff against the "
+        "current workspace. Always display the FULL untruncated result to "
+        "the user. Do NOT re-interpret or contradict the tool output."
     ),
     "parameters": {
         "type": "object",
@@ -331,11 +346,11 @@ WS_CKPT_DIFF_SCHEMA: Dict[str, Any] = {
             "to": {
                 "type": "string",
                 "description": (
-                    "Target snapshot id or name (defaults to current state)"
+                    "Target snapshot id or name. Omit to diff against current workspace state."
                 ),
             },
         },
-        "required": ["from", "to"],
+        "required": ["from"],
         "additionalProperties": False,
     },
 }
@@ -414,9 +429,15 @@ def handle_ws_ckpt_config(args: Dict[str, Any], **_kwargs) -> str:
             "Current ws-ckpt plugin configuration:",
             f"  autoCheckpoint: {cfg.auto_checkpoint}",
             f"  workspace:      {cfg.workspace}",
-            "",
-            f"Workspace policy (from `ws-ckpt config -w {ws} --format json`):",
         ]
+        if cfg.cron_schedules:
+            lines.append("  cronSchedules:")
+            for expr in cfg.cron_schedules:
+                lines.append(f"    - {expr}")
+        else:
+            lines.append("  cronSchedules:  (disabled)")
+        lines.append("")
+        lines.append(f"Workspace policy (from `ws-ckpt config -w {ws} --format json`):")
         # Use `--format json`, not raw daemon text: text isn't a contract,
         # while the JSON schema is versioned and lets us tell parse-error
         # from a real "disabled" (the openclaw bug we avoid here).
@@ -438,7 +459,7 @@ def handle_ws_ckpt_config(args: Dict[str, Any], **_kwargs) -> str:
         return _err(
             "Usage: ws-ckpt-config update <key> <value>. "
             "Available keys: autoCheckpoint, workspace, "
-            "maxSnapshotsNum, maxSnapshotsDuration."
+            "cronSchedules, maxSnapshotsNum, maxSnapshotsDuration."
         )
 
     # Persist via `ws-ckpt config -w <workspace>` so the change scopes to a
@@ -513,24 +534,60 @@ def handle_ws_ckpt_config(args: Dict[str, Any], **_kwargs) -> str:
         err = _persist_plugin_yaml(autoCheckpoint=coerced)
         if err:
             return _err(f"Failed to persist config: {err}")
-        from . import _get_manager  # local: __init__ imports tools
-        _get_manager().set_auto_checkpoint(coerced)
+        get_manager().set_auto_checkpoint(coerced)
         return _ok(f"Config updated: autoCheckpoint = {coerced}")
 
     if key == "workspace":
         if not value:
             return _err("workspace requires a path value")
         new_path = str(value).strip()
-        err = _persist_plugin_yaml(workspace=new_path)
+        mgr = get_manager()
+        old_path = mgr.config.workspace
+        mgr.set_workspace(new_path)
+        from .cron import CrontabManager
+        cron_map = mgr.config.cron_schedules
+        warnings = CrontabManager.migrate(old_path, new_path, cron_map)
+        err = _persist_plugin_yaml(workspace=new_path, cronSchedules=cron_map)
         if err:
             return _err(f"Failed to persist config: {err}")
-        from . import _get_manager  # local: __init__ imports tools
-        _get_manager().set_workspace(new_path)
-        return _ok(f"Config updated: workspace = {new_path}")
+        msg = f"Config updated: workspace = {new_path}"
+        if warnings:
+            msg += "\n\n" + "\n".join(warnings)
+        return _ok(msg)
+
+    if key == "cronSchedules":
+        if value is None:
+            return _err(
+                'cronSchedules requires a value. '
+                'Use: add "EXPR", remove "EXPR", or set \'["EXPR"]\''
+            )
+        from .cron import CrontabManager, parse_schedules_update
+        mgr = get_manager()
+        ws = mgr.config.workspace
+        if not ws:
+            return _err(_NO_WORKSPACE_MSG)
+        current = list(mgr.config.cron_schedules)
+        new_schedules, err_msg = parse_schedules_update(str(value), current)
+        if err_msg:
+            return _err(err_msg)
+        mgr.config.cron_schedules = new_schedules
+        err = _persist_plugin_yaml(cronSchedules=new_schedules)
+        if err:
+            return _err(f"Failed to persist config: {err}")
+        cron_note = ""
+        if not CrontabManager.sync_with_retry(ws, new_schedules):
+            cron_note = (
+                "\n\nWARNING: Failed to sync crontab after 3 attempts. "
+                "Config saved but cron snapshots will not run until next session start or manual retry."
+            )
+        return _ok(
+            f"cronSchedules updated: {new_schedules or '(disabled)'}"
+            + cron_note
+        )
 
     return _err(
         f"Unknown config key: {key}. Available: autoCheckpoint, "
-        "workspace, maxSnapshotsNum, maxSnapshotsDuration."
+        "workspace, cronSchedules, maxSnapshotsNum, maxSnapshotsDuration."
     )
 
 
@@ -596,7 +653,7 @@ def handle_ws_ckpt_checkpoint(args: Dict[str, Any], **_kwargs) -> str:
 
     message = (args.get("message") or "").strip() or "manual checkpoint"
 
-    cmd = ["ws-ckpt", "checkpoint", "-w", workspace, "-i", snapshot_id,
+    cmd = ["ws-ckpt", "checkpoint", "-w", workspace, "-s", snapshot_id,
            "-m", message]
     success, output = _run_ws_ckpt_cmd(cmd)
     return _ok(output) if success else _err(output)
@@ -605,17 +662,37 @@ def handle_ws_ckpt_checkpoint(args: Dict[str, Any], **_kwargs) -> str:
 def handle_ws_ckpt_rollback(args: Dict[str, Any], **_kwargs) -> str:
     """Handle ws-ckpt-rollback tool call."""
     target = (args.get("target") or "").strip()
-    if not target:
-        return _err("'target' is required")
+    num_ancestors = args.get("num_ancestors")
+    preview = args.get("preview") is True
+
+    if target and num_ancestors is not None:
+        return _err("'target' and 'num_ancestors' are mutually exclusive")
+    if not target and num_ancestors is None:
+        return _err("either 'target' or 'num_ancestors' is required")
+    if num_ancestors is not None:
+        try:
+            num_ancestors = int(num_ancestors)
+        except (ValueError, TypeError):
+            return _err("'num_ancestors' must be an integer >= 1")
+    if num_ancestors is not None and num_ancestors < 1:
+        return _err("'num_ancestors' must be >= 1")
 
     workspace, ws_err = _resolve_workspace(args)
     if ws_err:
         return ws_err
-    rejection = _reject_if_cwd_inside_workspace(workspace)
-    if rejection:
-        return rejection
+    if not preview:
+        rejection = _reject_if_cwd_inside_workspace(workspace)
+        if rejection:
+            return rejection
 
-    cmd = ["ws-ckpt", "rollback", "-w", workspace, "-s", target]
+    if num_ancestors is not None:
+        # Plugin snapshots after each response, so head == current state;
+        # +1 so user's "go back 1 step" skips the head snapshot.
+        cmd = ["ws-ckpt", "rollback", "-w", workspace, "-n", str(int(num_ancestors) + 1)]
+    else:
+        cmd = ["ws-ckpt", "rollback", "-w", workspace, "-s", target]
+    if preview:
+        cmd.append("--preview")
     success, output = _run_ws_ckpt_cmd(cmd)
     return _ok(output) if success else _err(output)
 
@@ -636,13 +713,13 @@ def handle_ws_ckpt_diff(args: Dict[str, Any], **_kwargs) -> str:
     to_id = (args.get("to") or "").strip()
     if not from_id:
         return _err("'from' is required")
-    if not to_id:
-        return _err("'to' is required")
 
     workspace, ws_err = _require_workspace()
     if ws_err:
         return ws_err
-    cmd = ["ws-ckpt", "diff", "-w", workspace, "--from", from_id, "--to", to_id]
+    cmd = ["ws-ckpt", "diff", "-w", workspace, "--from", from_id]
+    if to_id:
+        cmd.extend(["--to", to_id])
     success, output = _run_ws_ckpt_cmd(cmd)
     return _ok(output) if success else _err(output)
 

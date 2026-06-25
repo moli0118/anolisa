@@ -6,7 +6,10 @@
     "enabled": false,
     "kill_after_count": 3
   },
-  "https": [{"rule": ["dashscope.aliyuncs.com"]}],
+  "https": [
+    {"rule": ["dashscope.aliyuncs.com"]},
+    {"rule": ["api.openai.com"]}
+  ],
   "http": [],
   "encryption": {
     "public_key": ""
@@ -27,6 +30,7 @@
       {"rule": ["*openclaw-gatewa*"], "agent_name": "OpenClaw"},
       {"rule": ["node*", "*openclaw*"], "agent_name": "OpenClaw"},
       {"rule": ["*node*", "*openclaw*", "gatewa*"], "agent_name": "OpenClaw"},
+      {"rule": ["openclaw"], "agent_name": "OpenClaw"},
       {"rule": ["claude*"], "agent_name": "Claude"}
     ]
   }

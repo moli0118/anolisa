@@ -64,6 +64,9 @@
             "maintainers": [
                 {
                     "github": "chengshuyi"
+                },
+                {
+                    "github": "jfeng18"
                 }
             ]
         },
@@ -91,6 +94,14 @@
                 },
                 {
                     "github": "ikunkun-sys"
+                }
+            ]
+        },
+        {
+            "label": "component:skillfs",
+            "maintainers": [
+                {
+                    "github": "kongche-jbw"
                 }
             ]
         }

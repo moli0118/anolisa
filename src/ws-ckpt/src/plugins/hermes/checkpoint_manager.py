@@ -8,11 +8,13 @@ and returns structured results.
 from __future__ import annotations
 
 import json
+import os
 import subprocess
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Any, Dict, List, Optional
 
-from .config import HermesPluginConfig, MSG_TRUNCATE_LEN
+from .config import HermesPluginConfig, MSG_TRUNCATE_LEN, load_config
 
 DEFAULT_TIMEOUT_S = 30
 
@@ -128,6 +130,7 @@ class CheckpointManager:
                 capture_output=True,
                 text=True,
                 timeout=DEFAULT_TIMEOUT_S,
+                env={**os.environ, "WS_CKPT_AGENT_NAME": "hermes"},
             )
             return CommandOutput(
                 exit_code=result.returncode,
@@ -173,12 +176,12 @@ class CheckpointManager:
         """Create a checkpoint (snapshot) of the workspace.
 
         Equivalent to:
-            ws-ckpt checkpoint --workspace <ws> --id <id> [--message <msg>] [--metadata <json>]
+            ws-ckpt checkpoint --workspace <ws> --snapshot <id> [--message <msg>] [--metadata <json>]
         """
         args = [
             "checkpoint",
             "--workspace", self._config.workspace,
-            "--id", snapshot_id,
+            "--snapshot", snapshot_id,
         ]
 
         if message:
@@ -195,8 +198,57 @@ class CheckpointManager:
                 message=map_error_to_message(output.stderr, {"id": snapshot_id}),
             )
 
+        # CheckpointSkipped is a successful CLI response reported on stderr.
+        combined_output = f"{output.stdout}\n{output.stderr}"
+        if "Empty workspace, no snapshot created." in combined_output:
+            return CheckpointResult(
+                success=True,
+                skipped=True,
+                reason="Empty workspace, no snapshot created.",
+                message="Empty workspace, no snapshot created.",
+            )
+
         return CheckpointResult(
             success=True,
             message=f"Checkpoint created: {snapshot_id}",
             snapshot=snapshot_id,
         )
+
+
+# ---------------------------------------------------------------------------
+# Singleton & workspace helpers (shared by __init__ and tools)
+# ---------------------------------------------------------------------------
+
+_manager: Optional[CheckpointManager] = None
+
+
+def get_manager() -> CheckpointManager:
+    """Return (or create) the singleton CheckpointManager."""
+    global _manager
+    if _manager is None:
+        config = load_config()
+        _manager = CheckpointManager(config)
+        print("[ws-ckpt] Plugin initialized", flush=True)
+    return _manager
+
+
+def cwd_inside_workspace(workspace: str) -> tuple[bool, str]:
+    """Return (inside, cwd) — whether the current cwd is the workspace or a descendant."""
+    try:
+        cwd = Path(os.getcwd()).resolve()
+    except (FileNotFoundError, OSError):
+        return False, ""
+    try:
+        ws_path = Path(workspace).resolve()
+    except (FileNotFoundError, OSError):
+        return False, str(cwd)
+    return cwd == ws_path or ws_path in cwd.parents, str(cwd)
+
+
+def cwd_inside_workspace_reason(cwd: str, workspace: str) -> str:
+    return (
+        f"Refused: cwd={cwd} is inside workspace={workspace}. "
+        "ws-ckpt replaces the workspace inode during init/checkpoint/rollback, "
+        "which would invalidate the process cwd. "
+        "The user must launch the session from outside the workspace directory."
+    )

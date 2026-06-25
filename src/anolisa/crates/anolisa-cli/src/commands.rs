@@ -12,6 +12,7 @@ pub mod tier1;
 pub mod adapter;
 pub mod osbase;
 pub mod register;
+pub mod system;
 
 use std::fmt::Write as _;
 use std::path::{Path, PathBuf};
@@ -39,9 +40,10 @@ pub struct Cli {
     #[command(subcommand)]
     pub command: Commands,
 
-    /// Install scope: user (~/.local) or system (/usr/local)
-    #[arg(long, global = true, value_enum, default_value_t = InstallMode::User)]
-    pub install_mode: InstallMode,
+    /// Install scope: user (~/.local) or system (/usr/local).
+    /// When omitted, defaults to system if running as root, user otherwise.
+    #[arg(long, global = true, value_enum)]
+    pub install_mode: Option<InstallMode>,
 
     /// Custom install prefix (system-mode only)
     #[arg(long, global = true, value_name = "PATH")]
@@ -83,7 +85,7 @@ pub enum ComponentCommands {
     /// List available components from remote catalog
     #[command(visible_alias = "ls")]
     List(tier1::list::ListArgs),
-    /// Install a component from a configured backend (raw today; yum/npm planned)
+    /// Install a component from a configured backend (raw today; rpm/npm planned)
     Install(tier1::install::InstallArgs),
     /// Uninstall a component
     Uninstall(tier1::uninstall::UninstallArgs),
@@ -95,8 +97,14 @@ pub enum ComponentCommands {
     Logs(tier1::logs::LogsArgs),
     /// Restart a component's service
     Restart(tier1::restart::RestartArgs),
-    /// Update anolisa itself (no args) or a specific component
+    /// Update a component (`update <component>`), the CLI binary (`self`), or everything (`all`)
     Update(tier1::update::UpdateArgs),
+    /// Reconcile a component's ANOLISA state with rpmdb after manual RPM changes
+    Repair(tier1::repair::RepairArgs),
+    /// Drop a component's ANOLISA state record without any package operation
+    Forget(tier1::forget::ForgetArgs),
+    /// Record an already-installed system RPM as rpm-observed (system scope)
+    Adopt(tier1::adopt::AdoptArgs),
     /// Manage component-to-framework adapters
     Adapter(adapter::AdapterArgs),
 }
@@ -114,6 +122,8 @@ pub enum ManagementCommands {
     Bug(tier1::bug::BugArgs),
     /// Manage OS base layer (kernel / sandbox / security)
     Osbase(osbase::OsbaseArgs),
+    /// System helper daemon management
+    System(system::SystemArgs),
 }
 
 /// Build the top-level [`clap::Command`] with grouped help rendering.
@@ -196,6 +206,9 @@ pub fn dispatch(cli: Cli, ctx: &CliContext) -> Result<(), CliError> {
             ComponentCommands::Logs(args) => tier1::logs::handle(args, ctx),
             ComponentCommands::Restart(args) => tier1::restart::handle(args, ctx),
             ComponentCommands::Update(args) => tier1::update::handle(args, ctx),
+            ComponentCommands::Repair(args) => tier1::repair::handle(args, ctx),
+            ComponentCommands::Forget(args) => tier1::forget::handle(args, ctx),
+            ComponentCommands::Adopt(args) => tier1::adopt::handle(args, ctx),
             ComponentCommands::Adapter(args) => adapter::handle(args, ctx),
         },
         Commands::Management(cmd) => match cmd {
@@ -204,6 +217,7 @@ pub fn dispatch(cli: Cli, ctx: &CliContext) -> Result<(), CliError> {
             ManagementCommands::Env(args) => tier1::env::handle(args, ctx),
             ManagementCommands::Bug(args) => tier1::bug::handle(args, ctx),
             ManagementCommands::Osbase(args) => osbase::handle(args, ctx),
+            ManagementCommands::System(args) => system::handle(args, ctx),
         },
     }
 }
@@ -235,6 +249,8 @@ fn has_dot_segment(path: &Path) -> bool {
 
 #[cfg(test)]
 mod tests {
+    use clap::FromArgMatches as _;
+
     use super::*;
 
     fn ctx_with_prefix(prefix: PathBuf) -> CliContext {
@@ -308,5 +324,23 @@ mod tests {
             help.contains("ls"),
             "visible alias `ls` should appear in help output"
         );
+    }
+
+    #[test]
+    fn install_mode_is_none_when_omitted() {
+        let cmd = build_cli();
+        let matches = cmd.try_get_matches_from(["anolisa", "status"]).unwrap();
+        let cli = Cli::from_arg_matches(&matches).unwrap();
+        assert_eq!(cli.install_mode, None);
+    }
+
+    #[test]
+    fn install_mode_is_some_when_explicitly_set() {
+        let cmd = build_cli();
+        let matches = cmd
+            .try_get_matches_from(["anolisa", "--install-mode=system", "status"])
+            .unwrap();
+        let cli = Cli::from_arg_matches(&matches).unwrap();
+        assert_eq!(cli.install_mode, Some(InstallMode::System));
     }
 }

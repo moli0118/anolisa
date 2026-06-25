@@ -231,6 +231,38 @@ pub async fn diff_between_snapshots(snap_from: &Path, snap_to: &Path) -> Result<
         .context("diff task panicked")?
 }
 
+/// Diff a snapshot against the live (writable) workspace subvolume.
+///
+/// Creates a temporary read-only snapshot of `live_subvol` inside `snap_dir`,
+/// runs the diff, then removes the temporary snapshot regardless of outcome.
+pub async fn diff_against_live(
+    snap_from: &Path,
+    live_subvol: &Path,
+    snap_dir: &Path,
+) -> Result<Vec<DiffEntry>> {
+    use std::hash::{BuildHasher, Hasher, RandomState};
+
+    let h = RandomState::new().build_hasher().finish();
+    let tmp_snap = snap_dir.join(format!(".diff-tmp-{:06x}", h & 0xFFFFFF));
+
+    // Clean up stale temp snapshot from a prior crash before creating a new one.
+    if tmp_snap.exists() {
+        let _ = delete_subvolume(&tmp_snap).await;
+    }
+
+    create_snapshot(live_subvol, &tmp_snap, true)
+        .await
+        .context("failed to create temporary snapshot of live workspace for diff")?;
+
+    let result = diff_between_snapshots(snap_from, &tmp_snap).await;
+
+    if let Err(e) = delete_subvolume(&tmp_snap).await {
+        warn!(error = %e, path = %tmp_snap.display(), "failed to remove temp diff snapshot");
+    }
+
+    result
+}
+
 /// Blocking implementation of snapshot diff using `btrfs send | btrfs receive --dump`.
 fn diff_between_snapshots_blocking(snap_from: &Path, snap_to: &Path) -> Result<Vec<DiffEntry>> {
     use std::process::{Command as StdCommand, Stdio};
@@ -791,6 +823,31 @@ mod tests {
 
         // Cleanup
         let _ = delete_subvolume(&snap2).await;
+        let _ = delete_subvolume(&snap1).await;
+        let _ = delete_subvolume(&src).await;
+    }
+
+    #[tokio::test]
+    #[ignore = "requires root + btrfs filesystem"]
+    async fn diff_against_live_workspace() {
+        let base = PathBuf::from("/mnt/btrfs-workspace");
+        let src = base.join("test-diff-live-src");
+        let snap1 = base.join("test-diff-live-snap1");
+        // Cleanup prior
+        let _ = delete_subvolume(&snap1).await;
+        let _ = delete_subvolume(&src).await;
+
+        create_subvolume(&src).await.unwrap();
+        create_snapshot(&src, &snap1, true).await.unwrap();
+        // Modify the live subvolume after snapshot
+        tokio::fs::write(src.join("live-change.txt"), "world")
+            .await
+            .unwrap();
+
+        let entries = diff_against_live(&snap1, &src, &base).await.unwrap();
+        assert!(!entries.is_empty());
+
+        // Cleanup
         let _ = delete_subvolume(&snap1).await;
         let _ = delete_subvolume(&src).await;
     }

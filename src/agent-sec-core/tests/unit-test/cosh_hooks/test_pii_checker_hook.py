@@ -145,12 +145,20 @@ class TestCoshHookMain:
             json.dumps({"prompt": "Phone: 13800138000"}),
         )
 
+        expected_context = json.dumps(
+            {"agent_name": "cosh"},
+            ensure_ascii=False,
+            separators=(",", ":"),
+        )
         assert captured["args"] == [
             "agent-sec-cli",
+            "--trace-context",
+            expected_context,
             "scan-pii",
             "--stdin",
             "--format",
             "json",
+            "--redact-output",
             "--source",
             "user_input",
         ]
@@ -191,6 +199,7 @@ class TestCoshHookMain:
 
         expected_context = json.dumps(
             {
+                "agent_name": "cosh",
                 "trace_id": "trace-1",
                 "session_id": "session-1",
                 "run_id": "run-1",
@@ -208,10 +217,101 @@ class TestCoshHookMain:
             "--stdin",
             "--format",
             "json",
+            "--redact-output",
             "--source",
             "user_input",
         ]
         assert captured["kwargs"]["check"] is False
+
+    @pytest.mark.parametrize(
+        ("payload", "expected_stdin", "expected_source"),
+        [
+            (
+                {"hook_event_name": "PreToolUse", "tool_input": {"command": "echo ok"}},
+                '{"command":"echo ok"}',
+                "tool_input",
+            ),
+            (
+                {
+                    "hook_event_name": "PostToolUse",
+                    "tool_response": {"stdout": "alice@example.com"},
+                },
+                '{"stdout":"alice@example.com"}',
+                "tool_output",
+            ),
+            (
+                {
+                    "hook_event_name": "PostToolUseFailure",
+                    "error": "token=secret123456",
+                },
+                "token=secret123456",
+                "tool_output",
+            ),
+            (
+                {
+                    "hook_event_name": "AfterModel",
+                    "llm_response": {"text": "Contact alice@example.com"},
+                },
+                "Contact alice@example.com",
+                "model_output",
+            ),
+        ],
+    )
+    def test_scans_additional_hook_events(
+        self,
+        monkeypatch,
+        capsys,
+        payload,
+        expected_stdin,
+        expected_source,
+    ):
+        captured = {}
+
+        def fake_run(args, **kwargs):
+            captured["args"] = args
+            captured["kwargs"] = kwargs
+            return subprocess.CompletedProcess(
+                args=args,
+                returncode=0,
+                stdout=json.dumps(
+                    {
+                        "verdict": "warn",
+                        "findings": [
+                            {
+                                "type": "email",
+                                "severity": "warn",
+                                "evidence_redacted": "a***@example.com",
+                            }
+                        ],
+                    }
+                ),
+                stderr="",
+            )
+
+        monkeypatch.setattr(pii_checker_hook.subprocess, "run", fake_run)
+
+        output = self._run_main(monkeypatch, capsys, json.dumps(payload))
+
+        expected_context = json.dumps(
+            {"agent_name": "cosh"},
+            ensure_ascii=False,
+            separators=(",", ":"),
+        )
+        assert captured["args"] == [
+            "agent-sec-cli",
+            "--trace-context",
+            expected_context,
+            "scan-pii",
+            "--stdin",
+            "--format",
+            "json",
+            "--redact-output",
+            "--source",
+            expected_source,
+        ]
+        assert captured["kwargs"]["input"] == expected_stdin
+        assert output["decision"] == "allow"
+        assert "a***@example.com" in output["reason"]
 
     def test_cli_nonzero_allows(self, monkeypatch, capsys):
         def fake_run(args, **kwargs):
@@ -258,4 +358,10 @@ def test_manifest_registers_only_user_prompt_submit_for_pii():
                 if hook.get("name") == "pii-checker":
                     pii_locations.append(hook_name)
 
-    assert pii_locations == ["UserPromptSubmit"]
+    assert pii_locations == [
+        "PreToolUse",
+        "UserPromptSubmit",
+        "AfterModel",
+        "PostToolUse",
+        "PostToolUseFailure",
+    ]

@@ -7,6 +7,131 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.1.14] - 2026-06-24
+
+### Added
+
+- Raw components can now place systemd unit files with `{unitdir}`.
+- Raw components can now place user service unit files with `{userunitdir}`.
+- User-mode `anolisa install` now activates declared user-scope services.
+
+### Changed
+
+- User-mode `anolisa install` now resolves `%u` service templates to the current user.
+- System-mode `anolisa install` now preserves `%u` user service templates for later per-user activation.
+- `anolisa uninstall` now reloads systemd after removing declared service unit files.
+- `anolisa restart <component>` now restarts user-scope services from user-mode installs.
+
+### Fixed
+
+- `anolisa install` now starts freshly installed service units without a manual systemd reload.
+- `anolisa uninstall` now deactivates user-scope services from user-mode installs.
+- `anolisa adapter enable` now finds `{datadir}` skills from the package directory that provides the adapter.
+
+## [0.1.13] - 2026-06-23
+
+### Added
+
+- `anolisa adapter enable` now supports Hermes plugins.
+- `anolisa adapter enable` now installs declared OpenClaw skills.
+- `anolisa adapter enable` now applies declared OpenClaw config values.
+- `anolisa install` now starts declared services for raw components.
+- `anolisa install` now applies declared file capabilities for raw components.
+- `anolisa install` now runs declared hooks for raw components.
+- `anolisa update <component>` now restarts declared services for raw components.
+- `anolisa update <component>` now reapplies declared file capabilities for raw components.
+- `anolisa uninstall` now runs declared hooks for raw components.
+- `anolisa uninstall` now disables declared services after stopping them.
+
+### Changed
+
+- `anolisa adapter scan` now honors declared adapter resource locations.
+- `anolisa adapter enable` now reads package-installed adapter resources.
+- `anolisa install --dry-run` now previews declared capabilities for raw components.
+- `anolisa register status` now reports the latest registration after repeated changes.
+- Cancelled `anolisa register` and `unregister` prompts now exit successfully.
+
+### Fixed
+
+- `anolisa adapter status` now detects OpenClaw plugins from wrapped table output.
+- `anolisa adapter status` now ignores bundled Hermes plugins during checks.
+- `anolisa adapter` commands now find metadata shipped by RPM-installed components.
+- `anolisa register status` now reports sysom console registrations as active.
+
+## [0.1.12] - 2026-06-22
+
+### Added
+
+- `anolisa update <component>` can update raw-managed components from the raw backend.
+- `anolisa osbase sandbox list` shows scenarios from `sandbox.toml`.
+- `anolisa osbase sandbox uninstall <scenario>` can remove packages for a sandbox scenario.
+- `anolisa system setup` can install the helper service for non-root osbase commands.
+- `anolisa system status` can show helper health, version, uptime, and last operation.
+- `anolisa system teardown` can remove the helper service and sandbox config.
+- `anolisa env --json` includes distro identity fields.
+
+### Changed
+
+- `anolisa osbase sandbox install <scenario>` now installs scenarios defined in `sandbox.toml`.
+- Omitting `--install-mode` now selects `system` for root and `user` otherwise.
+- `anolisa update <component> --dry-run` now lists raw backend candidate versions.
+
+### Fixed
+
+- Legacy `yum` backend names in `repo.toml` and `--backend` now resolve to `rpm`.
+- Raw components installed with `--package` now update from the same package name.
+- `anolisa update <component>` now refuses raw updates that would downgrade a component.
+- `anolisa update <component>` now refuses raw updates when versions cannot be safely compared.
+
+## [0.1.11] - 2026-06-18
+
+### Added
+
+- `anolisa adopt <component>` can track a pre-installed system RPM without installing it.
+- `anolisa repair <component>` can refresh RPM component state after package details change.
+- `anolisa forget <component>` can stop tracking a component without removing packages or files.
+
+### Changed
+
+- `anolisa status <component>` now reports drifted RPM components when system package details change.
+- `anolisa uninstall` now keeps observed system RPMs unless `--remove-system-package` is used.
+- `anolisa install` now preserves adapter package resources when adopting RPM components.
+
+## [0.1.10] - 2026-06-17
+
+### Added
+
+- `anolisa install --backend rpm` can install missing RPM components through `dnf` and track them as managed.
+- `anolisa install` can adopt matching pre-installed system RPMs without downloading a raw package.
+- `anolisa update <component>` can update RPM-managed and RPM-observed components through `dnf`.
+- `anolisa status` now shows package, version, architecture, and source repo for RPM-backed components.
+- `anolisa status <component>` now reports matching untracked system RPMs as observed.
+
+### Changed
+
+- `anolisa update runtime <component>` is now `anolisa update <component>`; `self` and `all` stay subcommands.
+- `repo.toml` now uses `[backends.rpm]` instead of `[backends.yum]`.
+- `anolisa install --all` now lists adopted RPM components in the batch summary.
+
+### Fixed
+
+- `anolisa install --all` now prints the reason for each failed component in human output.
+- `anolisa install` now refuses automatic RPM detection when `rpm` or `dnf` is missing, with a `--backend raw` hint.
+- `anolisa install` no longer replaces a raw install if another install finishes first.
+
+## [0.1.9] - 2026-06-16
+
+### Added
+
+- `anolisa install --all` can install every available component from the catalog.
+- `anolisa install --all --fail-fast` can stop after the first failed component.
+- `anolisa install --all --json` returns one batch summary with per-component results.
+- `anolisa status` now shows adapter summaries for installed components.
+
+### Changed
+
+- `installed.toml` now distinguishes ANOLISA-managed packages from observed system RPMs.
+
 ## [0.1.8] - 2026-06-15
 
 ### Added
@@ -159,6 +284,131 @@ Initial alpha release of the ANOLISA CLI.
 版本号遵循 [语义化版本](https://semver.org/lang/zh-CN/)。
 
 ## [未发布]
+
+## [0.1.14] - 2026-06-24
+
+### 新增
+
+- raw 组件现可用 `{unitdir}` 放置系统单元。
+- raw 组件现可用 `{userunitdir}` 放置用户单元。
+- 用户模式 `anolisa install` 现会激活用户服务。
+
+### 变更
+
+- 用户模式 `anolisa install` 现将 `%u` 展开为当前用户。
+- 系统模式 `anolisa install` 现保留 `%u` 用户模板。
+- `anolisa uninstall` 删除单元文件后现会重载 systemd。
+- `anolisa restart <component>` 现会重启用户服务。
+
+### 修复
+
+- `anolisa install` 现无需手动重载即可启动新单元。
+- `anolisa uninstall` 现会停用用户模式安装的服务。
+- `anolisa adapter enable` 现从包目录查找 `{datadir}` 技能。
+
+## [0.1.13] - 2026-06-23
+
+### 新增
+
+- `anolisa adapter enable` 现支持 Hermes 插件。
+- `anolisa adapter enable` 现安装声明的 OpenClaw 技能。
+- `anolisa adapter enable` 现写入声明的 OpenClaw 配置。
+- `anolisa install` 现启动 raw 组件声明的服务。
+- `anolisa install` 现设置 raw 组件声明的文件能力。
+- `anolisa install` 现执行 raw 组件声明的钩子。
+- `anolisa update <component>` 现重启 raw 组件声明的服务。
+- `anolisa update <component>` 现重设 raw 组件声明的文件能力。
+- `anolisa uninstall` 现执行 raw 组件卸载钩子。
+- `anolisa uninstall` 现停用已停止的声明服务。
+
+### 变更
+
+- `anolisa adapter scan` 现按声明位置查找资源。
+- `anolisa adapter enable` 现读取包内适配器资源。
+- `anolisa install --dry-run` 现预览 raw 文件能力。
+- `anolisa register status` 现显示最新注册记录。
+- 取消 `anolisa register` 或 `unregister` 不再报错。
+
+### 修复
+
+- `anolisa adapter status` 现能识别换行的 OpenClaw 表格。
+- `anolisa adapter status` 检查 Hermes 时忽略内置插件。
+- `anolisa adapter` 现能找到 RPM 组件附带的元数据。
+- `anolisa register status` 现显示 sysom 控制台注册。
+
+## [0.1.12] - 2026-06-22
+
+### 新增
+
+- `anolisa update <component>` 可更新 raw 组件。
+- `anolisa osbase sandbox list` 可显示 `sandbox.toml` 场景。
+- `anolisa osbase sandbox uninstall <scenario>` 可移除场景软件包。
+- `anolisa system setup` 可为非 root osbase 命令安装助手服务。
+- `anolisa system status` 可显示助手健康状态。
+- `anolisa system teardown` 可移除助手服务和沙箱配置。
+- `anolisa env --json` 现包含发行版身份字段。
+
+### 变更
+
+- `anolisa osbase sandbox install <scenario>` 现按 `sandbox.toml` 安装场景。
+- 未指定 `--install-mode` 时，root 用 `system`，普通用户用 `user`。
+- `anolisa update <component> --dry-run` 现显示 raw 候选版本。
+
+### 修复
+
+- 旧 `yum` 后端名现会作为 `rpm` 处理。
+- 用 `--package` 安装的 raw 组件更新时复用包名。
+- `anolisa update <component>` 不再允许 raw 降级。
+- `anolisa update <component>` 无法比较版本时不再替换文件。
+
+## [0.1.11] - 2026-06-18
+
+### 新增
+
+- `anolisa adopt <component>` 可接管预装 RPM。
+- `anolisa repair <component>` 可刷新漂移的 RPM 状态。
+- `anolisa forget <component>` 可停止跟踪组件。
+
+### 变更
+
+- `anolisa status <component>` 现报告 RPM 状态漂移。
+- `anolisa uninstall` 默认保留观察到的系统 RPM。
+- `anolisa install` 接管 RPM 时保留适配器资源。
+
+## [0.1.10] - 2026-06-17
+
+### 新增
+
+- `anolisa install --backend rpm` 可通过 `dnf` 安装缺失 RPM 组件。
+- `anolisa install` 可接管匹配的预装系统 RPM。
+- `anolisa update <component>` 可通过 `dnf` 更新 RPM 组件。
+- `anolisa status` 现显示 RPM 组件的软件包来源。
+- `anolisa status <component>` 现显示匹配的未跟踪系统 RPM。
+
+### 变更
+
+- `anolisa update runtime <component>` 改为 `anolisa update <component>`。
+- `repo.toml` 现使用 `[backends.rpm]` 替代 `[backends.yum]`。
+- `anolisa install --all` 现在批量摘要列出接管的 RPM。
+
+### 修复
+
+- `anolisa install --all` 现在普通输出显示各组件失败原因。
+- `anolisa install` 在缺少 `rpm` 或 `dnf` 时提示 `--backend raw`。
+- `anolisa install` 不再覆盖先完成的 raw 安装。
+
+## [0.1.9] - 2026-06-16
+
+### 新增
+
+- `anolisa install --all` 可安装目录中的所有可用组件。
+- `anolisa install --all --fail-fast` 可在首个失败组件后停止。
+- `anolisa install --all --json` 现返回按组件汇总的批量结果。
+- `anolisa status` 现显示已安装组件的适配器摘要。
+
+### 变更
+
+- `installed.toml` 现区分 ANOLISA 管理包和只观察的系统 RPM。
 
 ## [0.1.8] - 2026-06-15
 

@@ -99,6 +99,8 @@ export interface PluginConfig {
   workspace: string;
   /** Whether to automatically create a checkpoint at end of each turn. */
   autoCheckpoint: boolean;
+  /** Cron expressions for scheduled snapshots. */
+  cronSchedules?: string[];
 }
 
 // ---------------------------------------------------------------------------

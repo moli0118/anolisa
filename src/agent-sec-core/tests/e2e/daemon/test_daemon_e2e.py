@@ -5,10 +5,12 @@ import os
 import shutil
 import signal
 import socket
+import sqlite3
 import stat
 import subprocess
 import sys
 import time
+import uuid
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -56,7 +58,8 @@ def test_daemon_health_over_unix_socket(
             {"id": "e2e-health", "method": "daemon.health"},
         )
 
-        assert response["id"] == "e2e-health"
+        assert response["request_id"] != "e2e-health"
+        _assert_uuid(response["request_id"])
         assert response["ok"] is True
         assert response["exit_code"] == 0
         assert response.get("error") is None
@@ -64,7 +67,8 @@ def test_daemon_health_over_unix_socket(
         assert response["data"]["socket"] == str(socket_path)
         assert response["data"]["prompt_scan"]["status"] == "pending"
         assert response["data"]["prompt_scan"]["loaded"] is False
-        assert response["data"]["jobs"] == []
+        jobs = {job["name"]: job for job in response["data"]["jobs"]}
+        assert jobs["skill-ledger-activation"]["state"] == "running"
         assert "inflight" in response["data"]["queues"]
         assert "queued" in response["data"]["queues"]
         assert stat.S_IMODE(socket_path.parent.stat().st_mode) == 0o700
@@ -74,7 +78,96 @@ def test_daemon_health_over_unix_socket(
 
     assert not socket_path.exists()
     assert output.returncode == 0
-    assert not _has_request_log(output, "e2e-health", "daemon.health")
+    assert not _has_request_log(tmp_path, response["request_id"], "daemon.health")
+
+
+def test_daemon_security_events_list_reads_sqlite_over_unix_socket(
+    daemon_command: list[str], tmp_path: Path
+) -> None:
+    socket_path = tmp_path / "runtime" / "daemon.sock"
+    _write_security_event(tmp_path / "data" / "security-events.db")
+    process = _start_daemon(daemon_command, socket_path, tmp_path)
+
+    try:
+        response = _call_daemon(
+            socket_path,
+            {
+                "method": "sec.events.list",
+                "params": {
+                    "session_id": "session-e2e",
+                    "include_details": True,
+                },
+            },
+        )
+    finally:
+        output = _stop_daemon(process)
+
+    assert response["ok"] is True
+    assert response["data"]["total"] == 1
+    assert response["data"]["items"][0]["event_id"] == "event-e2e"
+    assert response["data"]["items"][0]["details"]["request"]["code"] == "echo e2e"
+    assert output.returncode == 0
+    assert _has_request_log(tmp_path, response["request_id"], "sec.events.list")
+
+
+def test_daemon_security_query_methods_read_sqlite_over_unix_socket(
+    daemon_command: list[str], tmp_path: Path
+) -> None:
+    socket_path = tmp_path / "runtime" / "daemon.sock"
+    _write_security_event(tmp_path / "data" / "security-events.db")
+    process = _start_daemon(daemon_command, socket_path, tmp_path)
+
+    try:
+        summary_response = _call_daemon(
+            socket_path,
+            {
+                "method": "sec.summary",
+                "params": {"session_id": "session-e2e"},
+            },
+        )
+        get_response = _call_daemon(
+            socket_path,
+            {
+                "method": "sec.events.get",
+                "params": {"event_id": "event-e2e"},
+            },
+        )
+        count_response = _call_daemon(
+            socket_path,
+            {
+                "method": "sec.events.count_by",
+                "params": {
+                    "group_by": "run_id",
+                    "session_id": "session-e2e",
+                },
+            },
+        )
+    finally:
+        output = _stop_daemon(process)
+
+    assert summary_response["ok"] is True
+    assert summary_response["data"]["total"] == 1
+    assert summary_response["data"]["by_category"] == {"code_scan": 1}
+    assert summary_response["data"]["affected_runs"] == 1
+    assert summary_response["data"]["latest_events"][0]["event_id"] == "event-e2e"
+
+    assert get_response["ok"] is True
+    assert get_response["data"]["found"] is True
+    assert get_response["data"]["event"]["event_id"] == "event-e2e"
+    assert get_response["data"]["event"]["details"]["request"]["code"] == "echo e2e"
+
+    assert count_response["ok"] is True
+    assert count_response["data"]["group_by"] == "run_id"
+    assert count_response["data"]["items"] == [{"value": "run-e2e", "count": 1}]
+
+    assert output.returncode == 0
+    assert _has_request_log(tmp_path, summary_response["request_id"], "sec.summary")
+    assert _has_request_log(tmp_path, get_response["request_id"], "sec.events.get")
+    assert _has_request_log(
+        tmp_path,
+        count_response["request_id"],
+        "sec.events.count_by",
+    )
 
 
 def test_daemon_uses_xdg_runtime_dir_by_default(
@@ -118,7 +211,8 @@ def test_daemon_unknown_method_returns_structured_error(
     finally:
         output = _stop_daemon(process)
 
-    assert response["id"] == "e2e-unknown"
+    assert response["request_id"] != "e2e-unknown"
+    _assert_uuid(response["request_id"])
     assert response["ok"] is False
     assert response["exit_code"] == 1
     assert response["stderr"] == "unknown daemon method: unknown.method"
@@ -127,7 +221,13 @@ def test_daemon_unknown_method_returns_structured_error(
         "message": "unknown daemon method: unknown.method",
     }
     assert output.returncode == 0
-    assert _has_request_log(output, "e2e-unknown", "unknown.method")
+    assert _has_request_event(
+        tmp_path,
+        "daemon_request_started",
+        response["request_id"],
+        "unknown.method",
+    )
+    assert _has_request_log(tmp_path, response["request_id"], "unknown.method")
 
 
 def test_daemon_scan_prompt_returns_unavailable_until_model_ready(
@@ -152,14 +252,15 @@ def test_daemon_scan_prompt_returns_unavailable_until_model_ready(
     finally:
         output = _stop_daemon(process)
 
-    assert response["id"] == "e2e-scan-prompt-not-ready"
+    assert response["request_id"] != "e2e-scan-prompt-not-ready"
+    _assert_uuid(response["request_id"])
     assert response["ok"] is False
     assert response["exit_code"] == 1
     assert response["error"]["code"] == "unavailable"
     assert "prompt scanner is not ready" in response["stderr"]
     assert "status=pending" in response["stderr"]
     assert output.returncode == 0
-    assert _has_request_log(output, "e2e-scan-prompt-not-ready", "scan-prompt")
+    assert _has_request_log(tmp_path, response["request_id"], "scan-prompt")
 
 
 def test_daemon_returns_busy_when_connection_limit_is_exhausted(
@@ -184,6 +285,7 @@ def test_daemon_returns_busy_when_connection_limit_is_exhausted(
         output = _stop_daemon(process)
 
     assert response["ok"] is False
+    _assert_uuid(response["request_id"])
     assert response["exit_code"] == 1
     assert response["error"] == {"code": "busy", "message": "daemon is busy"}
     assert output.returncode == 0
@@ -215,8 +317,10 @@ def test_daemon_idle_client_times_out_and_releases_connection(
         output = _stop_daemon(process)
 
     assert timeout_response["ok"] is False
+    _assert_uuid(timeout_response["request_id"])
     assert timeout_response["error"]["code"] == "timeout"
     assert health_response["ok"] is True
+    _assert_uuid(health_response["request_id"])
     assert output.returncode == 0
 
 
@@ -230,6 +334,115 @@ def test_daemon_sigterm_graceful_shutdown(
 
     assert output.returncode == 0
     assert not socket_path.exists()
+    assert _has_daemon_event(tmp_path, "daemon_started")
+    assert _has_daemon_event(tmp_path, "daemon_stopped")
+
+
+def test_daemon_skillfs_notify_refreshes_skill_ledger_activation(
+    daemon_command: list[str], tmp_path: Path
+) -> None:
+    socket_path = tmp_path / "runtime" / "daemon.sock"
+    skill_dir = _make_skill(tmp_path / "skills", "weather")
+    process = _start_daemon(daemon_command, socket_path, tmp_path)
+
+    try:
+        response = _call_daemon(
+            socket_path,
+            {
+                "method": "skill_ledger.skillfs_notify_change",
+                "params": {
+                    "schemaVersion": 1,
+                    "skillDir": str(skill_dir),
+                    "skillName": "weather",
+                    "eventKind": "write",
+                    "paths": ["SKILL.md"],
+                },
+            },
+        )
+        activation = _wait_for_activation(skill_dir, process)
+    finally:
+        output = _stop_daemon(process)
+
+    assert response["ok"] is True
+    assert response["data"]["accepted"] is True
+    assert activation == {
+        "schemaVersion": 1,
+        "target": ".skill-meta/versions/v000001.snapshot",
+    }
+    assert output.returncode == 0
+    assert _has_request_log(
+        tmp_path,
+        response["request_id"],
+        "skill_ledger.skillfs_notify_change",
+    )
+
+
+def _write_security_event(db_path: Path) -> None:
+    db_path.parent.mkdir(parents=True, exist_ok=True)
+    conn = sqlite3.connect(db_path)
+    try:
+        conn.executescript("""
+            PRAGMA user_version = 3;
+            CREATE TABLE IF NOT EXISTS security_events (
+                event_id TEXT PRIMARY KEY,
+                event_type TEXT NOT NULL,
+                category TEXT NOT NULL,
+                result TEXT NOT NULL DEFAULT 'succeeded',
+                timestamp TEXT NOT NULL,
+                timestamp_epoch FLOAT NOT NULL,
+                trace_id TEXT NOT NULL DEFAULT '',
+                pid INTEGER NOT NULL,
+                uid INTEGER NOT NULL,
+                session_id TEXT,
+                run_id TEXT,
+                call_id TEXT,
+                tool_call_id TEXT,
+                verdict TEXT,
+                details TEXT NOT NULL
+            );
+            """)
+        conn.execute(
+            """
+            INSERT INTO security_events (
+                event_id,
+                event_type,
+                category,
+                result,
+                timestamp,
+                timestamp_epoch,
+                trace_id,
+                pid,
+                uid,
+                session_id,
+                run_id,
+                call_id,
+                tool_call_id,
+                verdict,
+                details
+            )
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                "event-e2e",
+                "code_scan",
+                "code_scan",
+                "succeeded",
+                "2026-06-09T00:00:00+00:00",
+                1780963200.0,
+                "trace-e2e",
+                os.getpid(),
+                os.getuid(),
+                "session-e2e",
+                "run-e2e",
+                None,
+                "tool-e2e",
+                None,
+                json.dumps({"request": {"code": "echo e2e"}}),
+            ),
+        )
+        conn.commit()
+    finally:
+        conn.close()
 
 
 def _start_daemon(
@@ -246,9 +459,12 @@ def _start_daemon(
     env.pop("AGENT_SEC_DAEMON_SOCKET", None)
     env["AGENT_SEC_DATA_DIR"] = str(tmp_path / "data")
     env["AGENT_SEC_DAEMON_PROMPT_PRELOAD"] = "0"
+    env["XDG_CONFIG_HOME"] = str(tmp_path / "xdg_config")
+    env["XDG_DATA_HOME"] = str(tmp_path / "xdg_data")
     env["PYTHONUNBUFFERED"] = "1"
     if xdg_runtime_dir is not None:
         env["XDG_RUNTIME_DIR"] = str(xdg_runtime_dir)
+    _write_skill_ledger_config(tmp_path)
 
     command = [*daemon_command, "serve"]
     if not use_default_socket:
@@ -266,6 +482,42 @@ def _start_daemon(
     if wait_for_health:
         _wait_for_health(socket_path, process)
     return process
+
+
+def _write_skill_ledger_config(tmp_path: Path) -> None:
+    config_dir = tmp_path / "xdg_config" / "agent-sec" / "skill-ledger"
+    config_dir.mkdir(parents=True, exist_ok=True)
+    (config_dir / "config.json").write_text(
+        json.dumps(
+            {
+                "enableDefaultSkillDirs": False,
+                "managedSkillDirs": [],
+            }
+        ),
+        encoding="utf-8",
+    )
+
+
+def _make_skill(parent: Path, name: str) -> Path:
+    skill_dir = parent / name
+    skill_dir.mkdir(parents=True)
+    (skill_dir / "SKILL.md").write_text(
+        f"---\nname: {name}\ndescription: Test skill\n---\n# {name}\n",
+        encoding="utf-8",
+    )
+    (skill_dir / "run.sh").write_text("echo ok\n", encoding="utf-8")
+    return skill_dir
+
+
+def _wait_for_activation(skill_dir: Path, process: subprocess.Popen[str]) -> dict:
+    activation_path = skill_dir / ".skill-meta" / "activation.json"
+    deadline = time.monotonic() + 10
+    while time.monotonic() < deadline:
+        _assert_process_running(process)
+        if activation_path.is_file():
+            return json.loads(activation_path.read_text(encoding="utf-8"))
+        time.sleep(0.05)
+    raise AssertionError(f"activation was not written: {activation_path}")
 
 
 def _stop_daemon(
@@ -350,6 +602,10 @@ def _call_daemon(socket_path: Path, request: dict[str, Any]) -> dict[str, Any]:
     return response
 
 
+def _assert_uuid(value: str) -> None:
+    uuid.UUID(value)
+
+
 def _read_response(client_socket: socket.socket) -> bytes:
     chunks: list[bytes] = []
     total_bytes = 0
@@ -372,19 +628,17 @@ def _read_response(client_socket: socket.socket) -> bytes:
     return raw_response
 
 
-def _has_request_log(output: DaemonOutput, request_id: str, method: str | None) -> bool:
-    for line in f"{output.stdout}\n{output.stderr}".splitlines():
-        try:
-            payload = json.loads(line)
-        except json.JSONDecodeError:
-            continue
+def _has_request_log(tmp_path: Path, request_id: str, method: str | None) -> bool:
+    for payload in _read_daemon_log_payloads(tmp_path):
+        data = payload.get("data", {})
         if (
             payload.get("event") == "daemon_request_completed"
             and payload.get("request_id") == request_id
-            and payload.get("method") == method
-            and "latency_ms" in payload
-            and "bytes_in" in payload
-            and "bytes_out" in payload
+            and isinstance(data, dict)
+            and data.get("method") == method
+            and "latency_ms" in data
+            and "bytes_in" in data
+            and "bytes_out" in data
         ):
             return True
     return False
@@ -399,7 +653,8 @@ def _has_request_event(
     return any(
         payload.get("event") == event
         and payload.get("request_id") == request_id
-        and payload.get("method") == method
+        and isinstance(payload.get("data"), dict)
+        and payload["data"].get("method") == method
         for payload in _read_daemon_log_payloads(tmp_path)
     )
 

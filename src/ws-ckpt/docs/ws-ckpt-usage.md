@@ -15,13 +15,13 @@ sudo yum install ws-ckpt
 ### 2.1 创建快照
 
 ```bash
-ws-ckpt checkpoint -w <workspace> -i <id> [-m <message>] [--metadata <json>] [--pin]
+ws-ckpt checkpoint -w <workspace> [-s <id>] [-m <message>] [--metadata <json>]
 ```
 
 | 参数            | 简写   | 必填 | 说明                   |
 | --------------- | ------ | ---- | ---------------------- |
 | `--workspace` | `-w` | 是   | 工作区路径或 ID       |
-| `--id`        | `-i` | 是   | 快照id 唯一标识快照   |
+| `--snapshot`  | `-s` | 否   | 快照 ID；省略时由 CLI 自动生成，显式指定时须在工作区内唯一 |
 | `--message`   | `-m` | 否   | 快照描述信息           |
 | `--metadata`  |        | 否   | JSON 格式的附加元数据 |
 
@@ -29,17 +29,22 @@ ws-ckpt checkpoint -w <workspace> -i <id> [-m <message>] [--metadata <json>] [--
 
 ```bash
 # 基本用法
-ws-ckpt checkpoint -w ./my-project -i test
+ws-ckpt checkpoint -w ./my-project -s test
+
+# 自动生成快照 ID
+ws-ckpt checkpoint -w ./my-project
 
 # 带message
-ws-ckpt checkpoint -w ./my-project -i test -m "initial state"
+ws-ckpt checkpoint -w ./my-project -s test -m "initial state"
 
 # 带元数据
-ws-ckpt checkpoint -w ws-6d5aaa -i test --metadata '{"tool":"write","file":"main.py"}'
+ws-ckpt checkpoint -w ws-6d5aaa -s test --metadata '{"tool":"write","file":"main.py"}'
 
 ```
 
-### 2.2 回滚到指定快照
+### 2.2 回滚快照
+
+#### 2.2.1 回滚到指定快照
 
 ```bash
 ws-ckpt rollback -w <workspace> -s <snapshot>
@@ -56,6 +61,41 @@ ws-ckpt rollback -w <workspace> -s <snapshot>
 # 按快照 ID 回滚
 ws-ckpt rollback -w ./my-project -s test
 ```
+
+#### 2.2.2 按祖先链回滚
+
+```bash
+ws-ckpt rollback -w <workspace> -n <N>
+```
+
+`--num-ancestors` 简写 `-n`，沿 parent 链回退 N 个祖先：
+- `-n 1`：回退到 head（上次 checkpoint）
+- `-n 2`：回退到 head 的 parent
+- `-n 3`：回退到 head.parent.parent
+
+与 `--snapshot/-s` 互斥。
+
+#### 2.2.3 预览回滚变更
+
+在上述两种目标选择方式后增加 `--preview`，可展示回滚将恢复的文件差异，但不会修改工作区：
+
+```bash
+ws-ckpt rollback -w ./my-project -s test --preview
+ws-ckpt rollback -w ./my-project -n 2 --preview
+```
+
+预览与实际回滚使用相同的目标解析规则。输出包含目标快照，以及该快照之后发生、rollback 将撤销的文件变更；标记含义与 `ws-ckpt diff` 相同。
+
+**示例**：
+
+```bash
+# 回退到上次快照
+ws-ckpt rollback -w ./my-project -n 1
+# 回退两步
+ws-ckpt rollback -w ./my-project -n 2
+```
+
+> **注意**：对于升级前创建的旧快照（无血缘信息），`-n` 会返回错误，需使用 `-s` 指定目标快照 ID。
 
 ### 2.3 列出快照
 
@@ -106,19 +146,23 @@ ws-ckpt delete -w ./my-project -s test --force
 ### 2.5 查看快照间差异
 
 ```bash
-ws-ckpt diff -w <workspace> -f <snapshot> -t <snapshot>
+ws-ckpt diff -w <workspace> -f <snapshot> [-t <snapshot>]
 ```
 
 | 参数            | 简写   | 必填 | 说明            |
 | --------------- | ------ | ---- | --------------- |
 | `--workspace` | `-w` | 是   | 工作区路径或 ID |
 | `--from`      | `-f` | 是   | 起始快照 ID     |
-| `--to`        | `-t` | 是   | 目标快照 ID     |
+| `--to`        | `-t` | 否   | 目标快照 ID；省略时与当前工作区比较 |
 
 **示例**：
 
 ```bash
+# 比较两个快照
 ws-ckpt diff -w ./my-project -f msg1-step0 -t test
+
+# 与当前工作区比较
+ws-ckpt diff -w ./my-project -f msg1-step0
 ```
 
 **输出标记说明**：
@@ -237,19 +281,19 @@ ws-ckpt init --workspace ~/.openclaw/workspace/
 
 # 2. 模拟 OpenClaw tool call 前后的 checkpoint
 echo "v1" > ~/.openclaw/workspace/main.py
-ws-ckpt checkpoint --workspace ~/.openclaw/workspace/ -i test -m "write main.py v1"
+ws-ckpt checkpoint --workspace ~/.openclaw/workspace/ -s test-v1 -m "write main.py v1"
 
 echo "v2 - bad change" > ~/.openclaw/workspace/main.py
-ws-ckpt checkpoint --workspace ~/.openclaw/workspace/ -i test -m "write main.py v2"
+ws-ckpt checkpoint --workspace ~/.openclaw/workspace/ -s test-v2 -m "write main.py v2"
 
 # 3. 发现改坏了，回滚
-ws-ckpt rollback --workspace ~/.openclaw/workspace/ --snapshot test
+ws-ckpt rollback --workspace ~/.openclaw/workspace/ --snapshot test-v1
 
 # 4. 验证回滚成功
 cat ~/.openclaw/workspace/main.py  # 应输出 "v1"
 
 # 5. 清理
-ws-ckpt delete --workspace ~/.openclaw/workspace/ -s test --force
+ws-ckpt delete --workspace ~/.openclaw/workspace/ -s test-v2 --force
 
 ```
 

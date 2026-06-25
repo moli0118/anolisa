@@ -7,6 +7,7 @@ import {
 import { InterruptionBadge } from '../components/InterruptionBadge';
 import { InterruptionPanel, ResolvedEventInfo } from '../components/InterruptionPanel';
 import { DateTimePicker } from '../components/DateTimePicker';
+import { SessionIdHelp } from '../components/SessionIdHelp';
 import {
   fetchSessions,
   fetchTraces,
@@ -780,7 +781,7 @@ export const ConversationList: React.FC<ConversationListProps> = () => {
   const [sessionInterruptionCounts, setSessionInterruptionCounts] = useState<Map<string, SessionInterruptionCount>>(new Map());
   const [conversationInterruptionCounts, setConversationInterruptionCounts] = useState<Map<string, ConversationInterruptionCount>>(new Map());
 
-  // Token savings per session (session_id → saved_tokens)
+  // Token savings per session (session_id → compounded_saved with saved_tokens fallback)
   const [savingsMap, setSavingsMap] = useState<Map<string, number>>(new Map());
 
   // Which session row is expanded to show traces
@@ -910,7 +911,9 @@ export const ConversationList: React.FC<ConversationListProps> = () => {
     setInterruptionStats(iStats);
     setSessionInterruptionCounts(new Map(iSessionCounts.map((c) => [c.session_id, c])));
     setConversationInterruptionCounts(new Map(iConvCounts.map((c) => [c.conversation_id, c])));
-    setSavingsMap(new Map(savingsResp?.sessions.map((s) => [s.session_id, s.compounded_saved]) ?? []));
+    setSavingsMap(new Map(
+      savingsResp?.sessions.map((s) => [s.session_id, s.compounded_saved ?? s.saved_tokens]) ?? []
+    ));
   }, []);
 
   const handleQuery = useCallback(async () => {
@@ -1129,7 +1132,10 @@ export const ConversationList: React.FC<ConversationListProps> = () => {
                   <thead className="bg-gray-50 border-b border-gray-200">
                     <tr>
                       <th className="px-4 lg:px-6 py-3 text-left text-xs font-semibold text-gray-600 uppercase tracking-wide w-[220px]">
-                        Session ID
+                        <span className="inline-flex items-center gap-1.5">
+                          <span>Session ID</span>
+                          <SessionIdHelp />
+                        </span>
                       </th>
                       <th className="px-4 lg:px-6 py-3 text-left text-xs font-semibold text-gray-600 uppercase tracking-wide w-[120px]">
                         Agent

@@ -145,12 +145,18 @@ def decode_xattr_activation(value: bytes) -> dict:
     return json.loads(value.decode("utf-8"))
 
 
-def resolve_skill_activation(skill_dir: Path, env_extra: dict) -> dict:
+def resolve_skill_activation(
+    skill_dir: Path,
+    env_extra: dict,
+    *,
+    policy: str = "pass_only",
+) -> dict:
     """Resolve activation using the same isolated env as CLI integration tests."""
     return resolve_skill_activation_with_backend(
         skill_dir,
         env_extra,
         NativeEd25519Backend(),
+        policy=policy,
     )
 
 
@@ -158,12 +164,14 @@ def resolve_skill_activation_with_backend(
     skill_dir: Path,
     env_extra: dict,
     backend: SigningBackend,
+    *,
+    policy: str = "pass_only",
 ) -> dict:
     """Resolve activation with a caller-provided signing backend."""
     previous = {key: os.environ.get(key) for key in env_extra}
     os.environ.update(env_extra)
     try:
-        return resolve_activation(str(skill_dir), backend)
+        return resolve_activation(str(skill_dir), backend, policy=policy)
     finally:
         for key, value in previous.items():
             if value is None:
@@ -768,14 +776,19 @@ def test_check_tampered_writes_security_event(ws):
 
     r = run_skill_ledger(["check", str(skill)], env_extra=env)
     assert r.returncode == 1
+    out = parse_json_output(r.stdout)
     events = read_security_events(event_data)
     reset_security_event_writers()
-    assert any(
-        event["category"] == "skill_ledger"
-        and event["details"]["result"].get("command") == "check"
-        and event["details"]["result"].get("status") == "tampered"
+    check_event = next(
+        event
         for event in events
+        if event["category"] == "skill_ledger"
+        and event["details"]["result"].get("command") == "check"
     )
+    event_result = check_event["details"]["result"]
+    assert event_result["status"] == "tampered"
+    assert event_result["skill_name"] == out["skillName"]
+    assert event_result["version_id"] == out["versionId"]
 
 
 def test_scan_recovers_tampered_latest_with_audit_event_and_valid_chain(ws):
@@ -820,12 +833,16 @@ def test_scan_recovers_tampered_latest_with_audit_event_and_valid_chain(ws):
 
     events = read_security_events(event_data)
     reset_security_event_writers()
-    assert any(
-        event["details"]["result"].get("command") == "scan"
-        and event["details"]["result"].get("auditEvents", [{}])[0].get("type")
-        == "tampered_recovered"
+    scan_event_result = next(
+        event["details"]["result"]
         for event in events
+        if event["details"]["result"].get("command") == "scan"
+        and event["details"]["result"].get("audit_events", [{}])[0].get("type")
+        == "tampered_recovered"
     )
+    assert scan_event_result["verdict"] == out["scanStatus"]
+    assert scan_event_result["version_id"] == out["versionId"]
+    assert scan_event_result["audit_events"][0]["to_status"] == out["scanStatus"]
 
 
 def test_certify_recovers_tampered_latest_with_audit_event(ws):
@@ -868,12 +885,15 @@ def test_certify_recovers_tampered_latest_with_audit_event(ws):
 
     events = read_security_events(event_data)
     reset_security_event_writers()
-    assert any(
-        event["details"]["result"].get("command") == "certify"
-        and event["details"]["result"].get("auditEvents", [{}])[0].get("type")
-        == "tampered_recovered"
+    certify_event_result = next(
+        event["details"]["result"]
         for event in events
+        if event["details"]["result"].get("command") == "certify"
+        and event["details"]["result"].get("audit_events", [{}])[0].get("type")
+        == "tampered_recovered"
     )
+    assert certify_event_result["verdict"] == out["scanStatus"]
+    assert certify_event_result["audit_events"][0]["to_status"] == out["scanStatus"]
 
 
 def test_check_deny_exit_code_1(ws):
@@ -1717,7 +1737,7 @@ def test_resolve_without_writing_reports_stable_xattr_status(ws):
 
 
 def test_resolve_warn_latest_falls_back_to_previous_pass_snapshot(ws):
-    """default pass_only policy does not activate warn snapshots."""
+    """Explicit pass_only policy does not activate warn snapshots."""
     skill = make_skill(ws.skills_dir, "resolve-warn", {"data.txt": "v1"})
     env = ws.env()
     pass_findings = write_findings_file(
@@ -1738,11 +1758,211 @@ def test_resolve_warn_latest_falls_back_to_previous_pass_snapshot(ws):
         ["certify", str(skill), "--findings", str(warn_findings)], env_extra=env
     )
 
-    out = resolve_skill_activation(skill, env)
+    out = resolve_skill_activation(skill, env, policy="pass_only")
 
     assert out["status"] == "warn"
     assert out["activeVersionId"] == "v000001"
     assert out["target"] == ".skill-meta/versions/v000001.snapshot"
+
+
+def test_resolve_latest_scanned_activates_warn_snapshot(ws):
+    """latest_scanned policy may activate the newest valid warn snapshot."""
+    skill = make_skill(ws.skills_dir, "resolve-latest-warn", {"data.txt": "v1"})
+    env = ws.env()
+    pass_findings = write_findings_file(
+        ws.fixtures,
+        "resolve-latest-warn-pass.json",
+        [{"rule": "ok", "level": "pass", "message": "pass"}],
+    )
+    warn_findings = write_findings_file(
+        ws.fixtures,
+        "resolve-latest-warn-warn.json",
+        [{"rule": "warn", "level": "warn", "message": "warning"}],
+    )
+    run_skill_ledger(
+        ["certify", str(skill), "--findings", str(pass_findings)], env_extra=env
+    )
+    (skill / "data.txt").write_text("v2 warning")
+    run_skill_ledger(
+        ["certify", str(skill), "--findings", str(warn_findings)], env_extra=env
+    )
+
+    out = resolve_skill_activation(skill, env, policy="latest_scanned")
+
+    assert out["status"] == "warn"
+    assert out["activeVersionId"] == "v000002"
+    assert out["target"] == ".skill-meta/versions/v000002.snapshot"
+    assert read_activation(skill) == {
+        "schemaVersion": 1,
+        "target": ".skill-meta/versions/v000002.snapshot",
+    }
+
+
+def test_resolve_pass_warn_only_activates_warn_snapshot(ws):
+    """pass_warn_only policy may activate the newest valid warn snapshot."""
+    skill = make_skill(ws.skills_dir, "resolve-pass-warn-warn", {"data.txt": "v1"})
+    env = ws.env()
+    pass_findings = write_findings_file(
+        ws.fixtures,
+        "resolve-pass-warn-warn-pass.json",
+        [{"rule": "ok", "level": "pass", "message": "pass"}],
+    )
+    warn_findings = write_findings_file(
+        ws.fixtures,
+        "resolve-pass-warn-warn-warn.json",
+        [{"rule": "warn", "level": "warn", "message": "warning"}],
+    )
+    run_skill_ledger(
+        ["certify", str(skill), "--findings", str(pass_findings)], env_extra=env
+    )
+    (skill / "data.txt").write_text("v2 warning")
+    run_skill_ledger(
+        ["certify", str(skill), "--findings", str(warn_findings)], env_extra=env
+    )
+
+    out = resolve_skill_activation(skill, env, policy="pass_warn_only")
+
+    assert out["status"] == "warn"
+    assert out["activeVersionId"] == "v000002"
+    assert out["target"] == ".skill-meta/versions/v000002.snapshot"
+    assert read_activation(skill) == {
+        "schemaVersion": 1,
+        "target": ".skill-meta/versions/v000002.snapshot",
+    }
+
+
+def test_resolve_latest_scanned_activates_deny_snapshot(ws):
+    """latest_scanned policy may activate the newest valid deny snapshot."""
+    skill = make_skill(ws.skills_dir, "resolve-latest-deny", {"data.txt": "v1"})
+    env = ws.env()
+    pass_findings = write_findings_file(
+        ws.fixtures,
+        "resolve-latest-deny-pass.json",
+        [{"rule": "ok", "level": "pass", "message": "pass"}],
+    )
+    deny_findings = write_findings_file(
+        ws.fixtures,
+        "resolve-latest-deny-deny.json",
+        [{"rule": "deny", "level": "deny", "message": "deny"}],
+    )
+    run_skill_ledger(
+        ["certify", str(skill), "--findings", str(pass_findings)], env_extra=env
+    )
+    (skill / "data.txt").write_text("v2 deny")
+    run_skill_ledger(
+        ["certify", str(skill), "--findings", str(deny_findings)], env_extra=env
+    )
+
+    out = resolve_skill_activation(skill, env, policy="latest_scanned")
+
+    assert out["status"] == "deny"
+    assert out["activeVersionId"] == "v000002"
+    assert out["target"] == ".skill-meta/versions/v000002.snapshot"
+
+
+def test_resolve_pass_warn_only_skips_deny_snapshot(ws):
+    """pass_warn_only skips deny snapshots and falls back to pass/warn history."""
+    skill = make_skill(ws.skills_dir, "resolve-pass-warn-deny", {"data.txt": "v1"})
+    env = ws.env()
+    warn_findings = write_findings_file(
+        ws.fixtures,
+        "resolve-pass-warn-deny-warn.json",
+        [{"rule": "warn", "level": "warn", "message": "warning"}],
+    )
+    deny_findings = write_findings_file(
+        ws.fixtures,
+        "resolve-pass-warn-deny-deny.json",
+        [{"rule": "deny", "level": "deny", "message": "deny"}],
+    )
+    run_skill_ledger(
+        ["certify", str(skill), "--findings", str(warn_findings)], env_extra=env
+    )
+    (skill / "data.txt").write_text("v2 deny")
+    run_skill_ledger(
+        ["certify", str(skill), "--findings", str(deny_findings)], env_extra=env
+    )
+
+    out = resolve_skill_activation(skill, env, policy="pass_warn_only")
+
+    assert out["status"] == "deny"
+    assert out["activeVersionId"] == "v000001"
+    assert out["target"] == ".skill-meta/versions/v000001.snapshot"
+    assert read_activation(skill) == {
+        "schemaVersion": 1,
+        "target": ".skill-meta/versions/v000001.snapshot",
+    }
+
+
+def test_resolve_pass_warn_only_returns_null_without_pass_or_warn_snapshot(ws):
+    """pass_warn_only writes target null when only deny history exists."""
+    skill = make_skill(ws.skills_dir, "resolve-pass-warn-only-deny", {"data.txt": "v1"})
+    env = ws.env()
+    deny_findings = write_findings_file(
+        ws.fixtures,
+        "resolve-pass-warn-only-deny.json",
+        [{"rule": "deny", "level": "deny", "message": "deny"}],
+    )
+    run_skill_ledger(
+        ["certify", str(skill), "--findings", str(deny_findings)], env_extra=env
+    )
+
+    out = resolve_skill_activation(skill, env, policy="pass_warn_only")
+
+    assert out["status"] == "deny"
+    assert out["activeVersionId"] is None
+    assert out["target"] is None
+    assert read_activation(skill) == {"schemaVersion": 1, "target": None}
+
+
+def test_resolve_latest_scanned_excludes_none_snapshot(ws):
+    """latest_scanned still requires a scanned pass/warn/deny snapshot."""
+    from agent_sec_cli.skill_ledger.core.certifier import (  # noqa: PLC0415
+        _persist_manifest_update,
+        _prepare_manifest_for_update,
+    )
+    from agent_sec_cli.skill_ledger.core.file_hasher import (  # noqa: PLC0415
+        compute_file_hashes,
+    )
+
+    skill = make_skill(ws.skills_dir, "resolve-latest-none", {"data.txt": "v1"})
+    env = ws.env()
+    previous = {key: os.environ.get(key) for key in env}
+    os.environ.update(env)
+    try:
+        backend = NativeEd25519Backend()
+        manifest, _state, new_version_created = _prepare_manifest_for_update(
+            str(skill),
+            compute_file_hashes(skill),
+            backend,
+        )
+        _persist_manifest_update(
+            str(skill),
+            manifest,
+            [],
+            backend,
+            new_version_created=new_version_created,
+        )
+    finally:
+        for key, value in previous.items():
+            if value is None:
+                os.environ.pop(key, None)
+            else:
+                os.environ[key] = value
+
+    out = resolve_skill_activation(skill, env, policy="latest_scanned")
+
+    assert out["status"] == "none"
+    assert out["activeVersionId"] is None
+    assert out["target"] is None
+    assert read_activation(skill) == {"schemaVersion": 1, "target": None}
+
+
+def test_resolve_rejects_unknown_activation_policy(ws):
+    skill = make_skill(ws.skills_dir, "resolve-bad-policy", {"data.txt": "v1"})
+    env = ws.env()
+
+    with pytest.raises(ValueError, match="unsupported activation policy"):
+        resolve_skill_activation(skill, env, policy="unknown")
 
 
 def test_resolve_tampered_latest_uses_previous_trusted_version_file(ws):

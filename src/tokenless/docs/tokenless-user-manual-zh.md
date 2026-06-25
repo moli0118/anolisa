@@ -728,6 +728,63 @@ tokenless stats show <记录ID>     # 查看某条记录的压缩前后文本
 tokenless stats summary           # 查看所有操作的汇总节省数据
 ```
 
+#### 压缩开关与 dry-run 对照（双跑对比）
+
+通过环境变量 `TOKENLESS_COMPRESSION_ENABLED`（或 `~/.tokenless/config.json` 的 `compression_enabled`）控制压缩是否真正生效：
+
+- `1`（默认）：正常压缩，压缩结果进入 LLM 上下文，记录 `mode=active`。
+- `0`（**dry-run 模式**）：算出压缩效果并记录预测值（`mode=dryrun`），但**原样输出原文**，不改变 LLM 上下文。
+
+对同一任务跑两次（一次关闭、一次开启），即可输出对照图，准确评估 tokenless 的真实节省效果：
+
+```bash
+# 跑 1：关闭压缩（dry-run 基线，输出原文）
+TOKENLESS_COMPRESSION_ENABLED=0  <跑同一任务>   # 记录于 session A
+# 跑 2：开启压缩（真实压缩）
+TOKENLESS_COMPRESSION_ENABLED=1  <跑同一任务>   # 记录于 session B
+
+# 对照图：baseline=context 上下文（原文），tokenless=压缩后
+tokenless stats summary --compare <session-A> <session-B>
+tokenless stats summary --compare <session-A> <session-B> --json   # 机器可读
+```
+
+> 注：tokenless 仅度量它经手的可压缩内容；模型推理 token / 真实计费 token 不在其内。
+
+#### SLS 日志记录（JSONL）{#sls-日志记录}
+
+除 SQLite 统计外，tokenless 还可将每次压缩以 **SLS（Simple Log Service）JSONL 记录**追加到文件，供日志采集器（如 ilogtail/SLS Logtail）摄取。
+
+> **文件归属**：SLS JSONL 文件由 **anolisa SLS 组件统一管理**（创建、轮转、删除）。tokenless **不主动管理日志文件**——每次写日志时先判断文件是否存在，**存在才追加，不存在则静默跳过**（视为「SLS 采集未就绪」）。tokenless 永不创建、截断或删除该文件及其目录。
+
+- **默认开启**。开关字段：`~/.tokenless/config.json` 的 `sls_enabled`（默认 `true`）；环境变量 `TOKENLESS_SLS_ENABLED` 优先级最高，`1`/`true`/`yes` 为开，其余为关。
+- **输出路径**：默认 `/var/log/anolisa/sls/ops/tokenless.jsonl`，可用 `TOKENLESS_SLS_PATH` 覆盖。路径必须位于 `/var/log/` 或 `/tmp/` 前缀下且不含 `..`，否则回退默认路径并告警。生产优先用 `/var/log/`（`/tmp/` 世界可写）。
+- **记录字段**（点分命名空间，匹配 SLS 入库 schema）：
+  - `component.name` / `component.version` / `component.agent_name`（agent 标识，非用户身份）
+  - `tokenless.operation`（如 `compress-schema` / `compress-response` / `compress-toon` / `rewrite-command`）
+  - `tokenless.session_id` / `tokenless.tool_use_id` / `tokenless.source_pid`（可选，为空时省略）
+  - `tokenless.compression.{before,after}_{chars,tokens}`、`chars_saved`、`tokens_saved` 及两者百分比
+
+  > 仅记录度量（字符数/token 数），**不记录压缩原文**，无敏感数据；记录本身不含时间戳/主机名/用户身份。
+
+```bash
+# 查看当前开关与来源（默认 / config file / env override）
+tokenless stats status
+
+# 快速验证：先由「anolisa SLS 组件」或手动建好文件，tokenless 才会写入
+mkdir -p /tmp && touch /tmp/tokenless-sls.jsonl
+TOKENLESS_STATS_ENABLED=1 TOKENLESS_SLS_ENABLED=1 \
+TOKENLESS_SLS_PATH=/tmp/tokenless-sls.jsonl \
+tokenless compress-response -f resp.json
+tail -n1 /tmp/tokenless-sls.jsonl | jq .
+```
+
+**关闭 SLS**：`TOKENLESS_SLS_ENABLED=0`，或在 `~/.tokenless/config.json` 设 `"sls_enabled": false`。
+
+**生产注意**：
+- tokenless 不创建日志文件或目录 —— 文件须由 anolisa SLS 组件预先创建；若文件不存在，tokenless 直接跳过写入。
+- 日志轮转由 anolisa SLS 组件负责，tokenless 不干预文件生命周期。
+- 写入失败 fail-silent（仅 stderr 告警，不影响主流程）。
+
 ### 6.3 验证安装
 
 ```bash
@@ -764,6 +821,7 @@ ls -la ~/.local/share/anolisa/adapters/tokenless/common/hooks/
 | JSON 解析错误 | 使用 `jq . < settings.json` 验证 JSON 格式 |
 | TOON 编码失败 | 确认 `toon` 二进制在 PATH 中；仅支持 JSON 输入 |
 | TOON 统计未记录 | 确认 `TOKENLESS_STATS_ENABLED` 未设置为 `0` 或 `false` |
+| SLS JSONL 未生成 | 确认 `TOKENLESS_SLS_ENABLED` 未设为 `0`/`false`（默认开）；检查 `TOKENLESS_SLS_PATH` 是否在 `/var/log/` 或 `/tmp/` 下；查看 stderr 的 `tokenless-sls:` 告警；目录需可写 |
 
 ### 7.2 OpenClaw 插件
 
@@ -834,6 +892,8 @@ jq --version
 | 自动修复脚本 | `adapters/tokenless/common/tokenless-env-fix.sh` |
 | TOON 编解码器（crates.io toon-format） | `toon-format` crate v0.4.6 |
 | 统计数据库（默认） | `~/.tokenless/stats.db` |
+| 配置文件（统计/SLS/压缩开关） | `~/.tokenless/config.json` |
+| SLS JSONL 输出（默认） | `/var/log/anolisa/sls/ops/tokenless.jsonl` |
 | 集成测试 | `crates/tokenless-schema/tests/integration_test.rs` |
 | TOON 端到端测试 | `tests/test-toon-full.sh` |
 | 全量测试套件 | `tests/run-all-tests.sh` |
@@ -868,5 +928,5 @@ jq --version
 ---
 
 **许可证**：MIT
-**文档版本**：1.2
-**最后更新**：2026-04-25
+**文档版本**：1.3
+**最后更新**：2026-06-24

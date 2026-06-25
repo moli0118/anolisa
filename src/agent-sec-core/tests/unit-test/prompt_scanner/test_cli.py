@@ -1,7 +1,10 @@
 """Unit tests for prompt_scanner CLI (scan-prompt command)."""
 
 import json
+import os
+import tempfile
 import unittest
+from contextlib import contextmanager
 from io import StringIO
 from typing import Any
 from unittest.mock import patch
@@ -11,15 +14,14 @@ from agent_sec_cli.correlation_context import (
     clear_process_trace_context,
     init_process_trace_context,
 )
-from agent_sec_cli.daemon.errors import (
-    DaemonRuntimePathError,
-    DaemonTransportError,
-)
+from agent_sec_cli.daemon.env import DAEMON_DISABLED_ENV, SOCKET_ENV
+from agent_sec_cli.daemon.errors import DaemonTransportError
 from agent_sec_cli.daemon.protocol import DaemonResponse
 from agent_sec_cli.prompt_scanner.cli import (
     _build_error_output,
     _call_scan_prompt_daemon,
     _print_text,
+    _should_use_daemon,
     scanner_app,
 )
 from agent_sec_cli.prompt_scanner.result import (
@@ -28,6 +30,7 @@ from agent_sec_cli.prompt_scanner.result import (
     ThreatType,
     Verdict,
 )
+from agent_sec_cli.security_middleware.result import ActionResult
 from typer.testing import CliRunner
 
 # ---------------------------------------------------------------------------
@@ -61,22 +64,42 @@ def _make_scan_result(
     )
 
 
+@contextmanager
 def _mock_daemon_call(result: ScanResult):
     """Context manager: patch daemon scan-prompt call to return *result*."""
-    import json as _json
-
     d = result.to_dict()
     daemon_response = DaemonResponse(
-        id="req-prompt",
+        request_id="req-prompt",
         ok=True,
         data=d,
-        stdout=_json.dumps(d, indent=2, ensure_ascii=False),
+        stdout=json.dumps(d, indent=2, ensure_ascii=False),
         exit_code=0,
     )
-    return patch(
+    with patch(
+        "agent_sec_cli.prompt_scanner.cli._should_use_daemon",
+        return_value=True,
+    ), patch(
         "agent_sec_cli.prompt_scanner.cli._call_scan_prompt_daemon",
         return_value=daemon_response,
+    ) as mock_daemon:
+        yield mock_daemon
+
+
+@contextmanager
+def _mock_invoke(result: ScanResult):
+    """Context manager: patch security_middleware.invoke to return *result*."""
+    d = result.to_dict()
+    mw_result = ActionResult(
+        success=(result.verdict != Verdict.ERROR),
+        data=d,
+        stdout=json.dumps(d, indent=2, ensure_ascii=False),
+        exit_code=0,
     )
+    with patch(
+        "agent_sec_cli.prompt_scanner.cli.invoke",
+        return_value=mw_result,
+    ) as mock_invoke:
+        yield mock_invoke
 
 
 # ---------------------------------------------------------------------------
@@ -137,6 +160,23 @@ class TestCliTextFlag(unittest.TestCase):
                 ["--text", "hello", "--source", "user_input"],
             )
             mock_daemon.assert_called_once_with("hello", "standard", "user_input")
+
+    def test_empty_text_flag_exits_without_output(self) -> None:
+        with patch(
+            "agent_sec_cli.prompt_scanner.cli._should_use_daemon"
+        ) as mock_backend_selection, patch(
+            "agent_sec_cli.prompt_scanner.cli._call_scan_prompt_daemon"
+        ) as mock_daemon, patch(
+            "agent_sec_cli.prompt_scanner.cli.invoke"
+        ) as mock_middleware:
+            out = runner.invoke(scanner_app, ["--text", ""])
+
+        self.assertEqual(out.exit_code, 0)
+        self.assertEqual(out.stdout, "")
+        self.assertEqual(out.stderr, "")
+        mock_backend_selection.assert_not_called()
+        mock_daemon.assert_not_called()
+        mock_middleware.assert_not_called()
 
 
 # ---------------------------------------------------------------------------
@@ -203,9 +243,6 @@ class TestCliInputFile(unittest.TestCase):
         self.assertIn("not found", out.stderr)
 
     def test_file_is_read(self, tmp_path=None) -> None:
-        import os
-        import tempfile
-
         result = _make_scan_result()
         with tempfile.NamedTemporaryFile(
             mode="w", suffix=".txt", delete=False, encoding="utf-8"
@@ -245,55 +282,189 @@ class TestCliStdin(unittest.TestCase):
 # ---------------------------------------------------------------------------
 
 
-class TestCliDaemonUnavailableHandling(unittest.TestCase):
+class TestCliDaemonFallbackHandling(unittest.TestCase):
     def tearDown(self) -> None:
         clear_process_trace_context()
 
-    def test_daemon_transport_error_returns_error_json(self) -> None:
+    def test_missing_daemon_env_uses_middleware(self) -> None:
+        result = _make_scan_result()
         with patch(
+            "agent_sec_cli.prompt_scanner.cli._should_use_daemon",
+            return_value=False,
+        ) as mock_backend_selection, patch(
+            "agent_sec_cli.prompt_scanner.cli._call_scan_prompt_daemon"
+        ) as mock_daemon, _mock_invoke(
+            result
+        ) as mock_middleware:
+            out = runner.invoke(scanner_app, ["--text", "hello"])
+
+        self.assertEqual(out.exit_code, 0)
+        parsed = json.loads(out.stdout)
+        self.assertEqual(parsed["verdict"], "pass")
+        self.assertTrue(parsed["ok"])
+        self.assertEqual(out.stderr, "")
+        mock_backend_selection.assert_called_once_with()
+        mock_daemon.assert_not_called()
+        mock_middleware.assert_called_once_with(
+            "prompt_scan",
+            text="hello",
+            mode="standard",
+            source="",
+        )
+
+    def test_middleware_text_format_outputs_verdict_line(self) -> None:
+        result = _make_scan_result()
+        with patch(
+            "agent_sec_cli.prompt_scanner.cli._should_use_daemon",
+            return_value=False,
+        ) as mock_backend_selection, patch(
+            "agent_sec_cli.prompt_scanner.cli._call_scan_prompt_daemon"
+        ) as mock_daemon, _mock_invoke(
+            result
+        ) as mock_middleware:
+            out = runner.invoke(
+                scanner_app,
+                ["--text", "hello", "--format", "text"],
+            )
+
+        self.assertEqual(out.exit_code, 0)
+        self.assertIn("Verdict", out.stdout)
+        self.assertIn("PASS", out.stdout)
+        self.assertEqual(out.stderr, "")
+        mock_backend_selection.assert_called_once_with()
+        mock_daemon.assert_not_called()
+        mock_middleware.assert_called_once_with(
+            "prompt_scan",
+            text="hello",
+            mode="standard",
+            source="",
+        )
+
+    def test_middleware_text_format_error_outputs_to_stderr(self) -> None:
+        mw_result = ActionResult(
+            success=False,
+            data={},
+            stdout="",
+            error="prompt_scan error: no input text provided",
+            exit_code=1,
+        )
+        with patch(
+            "agent_sec_cli.prompt_scanner.cli._should_use_daemon",
+            return_value=False,
+        ), patch(
+            "agent_sec_cli.prompt_scanner.cli._call_scan_prompt_daemon"
+        ) as mock_daemon, patch(
+            "agent_sec_cli.prompt_scanner.cli.invoke",
+            return_value=mw_result,
+        ) as mock_middleware:
+            out = runner.invoke(
+                scanner_app,
+                ["--text", "hello", "--format", "text"],
+            )
+
+        self.assertEqual(out.exit_code, 1)
+        self.assertEqual(out.stdout, "")
+        self.assertIn("prompt_scan error: no input text provided", out.stderr)
+        mock_daemon.assert_not_called()
+        mock_middleware.assert_called_once_with(
+            "prompt_scan",
+            text="hello",
+            mode="standard",
+            source="",
+        )
+
+    def test_middleware_json_format_falls_back_to_data_when_stdout_empty(self) -> None:
+        result = _make_scan_result()
+        data = result.to_dict()
+        mw_result = ActionResult(
+            success=True,
+            data=data,
+            stdout="",
+            exit_code=0,
+        )
+        with patch(
+            "agent_sec_cli.prompt_scanner.cli._should_use_daemon",
+            return_value=False,
+        ), patch(
+            "agent_sec_cli.prompt_scanner.cli.invoke",
+            return_value=mw_result,
+        ):
+            out = runner.invoke(scanner_app, ["--text", "hello", "--format", "json"])
+
+        self.assertEqual(out.exit_code, 0)
+        parsed = json.loads(out.stdout)
+        self.assertEqual(parsed["verdict"], "pass")
+        self.assertEqual(out.stderr, "")
+
+    def test_middleware_invoke_error_returns_error_json(self) -> None:
+        with patch(
+            "agent_sec_cli.prompt_scanner.cli._should_use_daemon",
+            return_value=False,
+        ), patch(
+            "agent_sec_cli.prompt_scanner.cli._call_scan_prompt_daemon"
+        ) as mock_daemon, patch(
+            "agent_sec_cli.prompt_scanner.cli.invoke",
+            side_effect=RuntimeError("middleware exploded"),
+        ) as mock_middleware:
+            out = runner.invoke(scanner_app, ["--text", "hello"])
+
+        self.assertEqual(out.exit_code, 0)
+        parsed = json.loads(out.stdout)
+        self.assertEqual(parsed["verdict"], "error")
+        self.assertIn("Scanner error: middleware exploded", parsed["summary"])
+        self.assertEqual(out.stderr, "")
+        mock_daemon.assert_not_called()
+        mock_middleware.assert_called_once_with(
+            "prompt_scan",
+            text="hello",
+            mode="standard",
+            source="",
+        )
+
+    def test_should_use_daemon_true_without_socket_env(self) -> None:
+        with patch.dict(os.environ, {}, clear=True):
+            self.assertTrue(_should_use_daemon())
+
+    def test_should_use_daemon_true_with_socket_env_only(self) -> None:
+        with patch.dict(
+            os.environ, {SOCKET_ENV: "/run/agent-sec/daemon.sock"}, clear=True
+        ):
+            self.assertTrue(_should_use_daemon())
+
+    def test_should_use_daemon_false_with_disabled_env(self) -> None:
+        with patch.dict(os.environ, {DAEMON_DISABLED_ENV: "1"}, clear=True):
+            self.assertFalse(_should_use_daemon())
+
+    def test_should_use_daemon_true_with_disabled_env_false_value(self) -> None:
+        with patch.dict(os.environ, {DAEMON_DISABLED_ENV: "false"}, clear=True):
+            self.assertTrue(_should_use_daemon())
+
+    def test_daemon_transport_error_does_not_fallback_when_env_enabled(
+        self,
+    ) -> None:
+        with patch(
+            "agent_sec_cli.prompt_scanner.cli._should_use_daemon",
+            return_value=True,
+        ), patch(
             "agent_sec_cli.prompt_scanner.cli._call_scan_prompt_daemon",
             side_effect=DaemonTransportError("socket missing"),
-        ):
+        ), patch(
+            "agent_sec_cli.prompt_scanner.cli.invoke"
+        ) as mock_middleware:
             out = runner.invoke(scanner_app, ["--text", "hello"])
+
         self.assertEqual(out.exit_code, 0)
         parsed = json.loads(out.stdout)
         self.assertEqual(parsed["verdict"], "error")
-        self.assertIn("daemon is unavailable", parsed["summary"])
         self.assertIn("socket missing", parsed["summary"])
         self.assertEqual(out.stderr, "")
+        mock_middleware.assert_not_called()
 
-    def test_daemon_runtime_path_error_returns_error_json(self) -> None:
-        with patch(
-            "agent_sec_cli.prompt_scanner.cli._call_scan_prompt_daemon",
-            side_effect=DaemonRuntimePathError(
-                "XDG_RUNTIME_DIR is required for agent-sec daemon"
-            ),
-        ):
-            out = runner.invoke(scanner_app, ["--text", "hello"])
-        self.assertEqual(out.exit_code, 0)
-        parsed = json.loads(out.stdout)
-        self.assertEqual(parsed["verdict"], "error")
-        self.assertIn("daemon is unavailable", parsed["summary"])
-        self.assertIn("XDG_RUNTIME_DIR is required", parsed["summary"])
-        self.assertEqual(out.stderr, "")
-
-    def test_unwrapped_daemon_call_error_returns_error_json(self) -> None:
-        with patch(
-            "agent_sec_cli.prompt_scanner.cli._call_scan_prompt_daemon",
-            side_effect=ConnectionResetError("connection reset by peer"),
-        ):
-            out = runner.invoke(scanner_app, ["--text", "hello"])
-
-        self.assertEqual(out.exit_code, 0)
-        parsed = json.loads(out.stdout)
-        self.assertEqual(parsed["verdict"], "error")
-        self.assertIn("daemon is unavailable", parsed["summary"])
-        self.assertIn("connection reset by peer", parsed["summary"])
-        self.assertEqual(out.stderr, "")
-
-    def test_daemon_unavailable_response_returns_error_json(self) -> None:
+    def test_daemon_unavailable_response_does_not_fallback_when_env_enabled(
+        self,
+    ) -> None:
         daemon_response = DaemonResponse(
-            id="req-prompt",
+            request_id="req-prompt",
             ok=False,
             stderr="prompt scanner is not ready: status=loading",
             exit_code=1,
@@ -303,9 +474,14 @@ class TestCliDaemonUnavailableHandling(unittest.TestCase):
             },
         )
         with patch(
+            "agent_sec_cli.prompt_scanner.cli._should_use_daemon",
+            return_value=True,
+        ), patch(
             "agent_sec_cli.prompt_scanner.cli._call_scan_prompt_daemon",
             return_value=daemon_response,
-        ):
+        ), patch(
+            "agent_sec_cli.prompt_scanner.cli.invoke"
+        ) as mock_middleware:
             out = runner.invoke(scanner_app, ["--text", "hello"])
 
         self.assertEqual(out.exit_code, 0)
@@ -313,11 +489,62 @@ class TestCliDaemonUnavailableHandling(unittest.TestCase):
         self.assertEqual(parsed["verdict"], "error")
         self.assertIn("status=loading", parsed["summary"])
         self.assertEqual(out.stderr, "")
+        mock_middleware.assert_not_called()
+
+    def test_daemon_scan_unexpected_error_returns_error_json_when_env_enabled(
+        self,
+    ) -> None:
+        with patch(
+            "agent_sec_cli.prompt_scanner.cli._should_use_daemon",
+            return_value=True,
+        ), patch(
+            "agent_sec_cli.prompt_scanner.cli._call_scan_prompt_daemon",
+            side_effect=RuntimeError("scan request failed unexpectedly"),
+        ), patch(
+            "agent_sec_cli.prompt_scanner.cli.invoke"
+        ) as mock_middleware:
+            out = runner.invoke(scanner_app, ["--text", "hello"])
+
+        self.assertEqual(out.exit_code, 0)
+        parsed = json.loads(out.stdout)
+        self.assertEqual(parsed["verdict"], "error")
+        self.assertIn("scan request failed unexpectedly", parsed["summary"])
+        self.assertEqual(out.stderr, "")
+        mock_middleware.assert_not_called()
+
+    def test_daemon_protocol_error_response_does_not_fallback(self) -> None:
+        daemon_response = DaemonResponse(
+            request_id="00000000-0000-4000-8000-000000000000",
+            ok=False,
+            stderr="request must be valid",
+            exit_code=1,
+            error={
+                "code": "bad_request",
+                "message": "request must be valid",
+            },
+        )
+        with patch(
+            "agent_sec_cli.prompt_scanner.cli._should_use_daemon",
+            return_value=True,
+        ), patch(
+            "agent_sec_cli.prompt_scanner.cli._call_scan_prompt_daemon",
+            return_value=daemon_response,
+        ), patch(
+            "agent_sec_cli.prompt_scanner.cli.invoke"
+        ) as mock_middleware:
+            out = runner.invoke(scanner_app, ["--text", "hello"])
+
+        self.assertEqual(out.exit_code, 0)
+        parsed = json.loads(out.stdout)
+        self.assertEqual(parsed["verdict"], "error")
+        self.assertEqual(parsed["summary"], "request must be valid")
+        self.assertEqual(out.stderr, "")
+        mock_middleware.assert_not_called()
 
     def test_daemon_action_nonzero_exit_outputs_json_before_exit(self) -> None:
         data = _build_error_output("Scanner error: model exploded")
         daemon_response = DaemonResponse(
-            id="req-prompt",
+            request_id="req-prompt",
             ok=True,
             data=data,
             stdout=json.dumps(data, indent=2, ensure_ascii=False),
@@ -325,6 +552,9 @@ class TestCliDaemonUnavailableHandling(unittest.TestCase):
             exit_code=1,
         )
         with patch(
+            "agent_sec_cli.prompt_scanner.cli._should_use_daemon",
+            return_value=True,
+        ), patch(
             "agent_sec_cli.prompt_scanner.cli._call_scan_prompt_daemon",
             return_value=daemon_response,
         ):
@@ -339,7 +569,7 @@ class TestCliDaemonUnavailableHandling(unittest.TestCase):
     def test_daemon_action_nonzero_exit_outputs_text_before_exit(self) -> None:
         data = _build_error_output("Scanner error: model exploded")
         daemon_response = DaemonResponse(
-            id="req-prompt",
+            request_id="req-prompt",
             ok=True,
             data=data,
             stdout="{}",
@@ -347,6 +577,9 @@ class TestCliDaemonUnavailableHandling(unittest.TestCase):
             exit_code=2,
         )
         with patch(
+            "agent_sec_cli.prompt_scanner.cli._should_use_daemon",
+            return_value=True,
+        ), patch(
             "agent_sec_cli.prompt_scanner.cli._call_scan_prompt_daemon",
             return_value=daemon_response,
         ):
@@ -359,7 +592,7 @@ class TestCliDaemonUnavailableHandling(unittest.TestCase):
 
     def test_daemon_action_nonzero_exit_without_output_returns_error_json(self) -> None:
         daemon_response = DaemonResponse(
-            id="req-prompt",
+            request_id="req-prompt",
             ok=True,
             data={},
             stdout="",
@@ -367,6 +600,9 @@ class TestCliDaemonUnavailableHandling(unittest.TestCase):
             exit_code=1,
         )
         with patch(
+            "agent_sec_cli.prompt_scanner.cli._should_use_daemon",
+            return_value=True,
+        ), patch(
             "agent_sec_cli.prompt_scanner.cli._call_scan_prompt_daemon",
             return_value=daemon_response,
         ):
@@ -379,7 +615,9 @@ class TestCliDaemonUnavailableHandling(unittest.TestCase):
         self.assertEqual(out.stderr, "")
 
     @patch("agent_sec_cli.prompt_scanner.cli.DaemonClient")
-    def test_daemon_call_passes_trace_context_payload(self, mock_client_cls) -> None:
+    def test_daemon_call_passes_current_trace_context_to_daemon_client(
+        self, mock_client_cls
+    ) -> None:
         init_process_trace_context(
             TraceContext(
                 trace_id="trace-1",
@@ -387,11 +625,12 @@ class TestCliDaemonUnavailableHandling(unittest.TestCase):
                 run_id="run-1",
                 call_id="call-1",
                 tool_call_id="tool-1",
+                agent_name="hermes",
             )
         )
         mock_client = mock_client_cls.return_value
         mock_client.call.return_value = DaemonResponse(
-            id="req-prompt",
+            request_id="req-prompt",
             ok=True,
             data={},
             stdout="{}",
@@ -408,8 +647,35 @@ class TestCliDaemonUnavailableHandling(unittest.TestCase):
                 "run_id": "run-1",
                 "call_id": "call-1",
                 "tool_call_id": "tool-1",
+                "agent_name": "hermes",
             },
+            caller="cli",
             timeout_ms=30_000,
+        )
+
+    @patch("agent_sec_cli.prompt_scanner.cli.DaemonClient")
+    def test_daemon_call_sanitizes_trace_context_payload(self, mock_client_cls) -> None:
+        init_process_trace_context(
+            TraceContext(
+                trace_id=" trace-1 ",
+                session_id="   ",
+                run_id="run-1",
+                agent_name=" hermes ",
+            )
+        )
+        mock_client = mock_client_cls.return_value
+        mock_client.call.return_value = DaemonResponse(
+            request_id="req-prompt",
+            ok=True,
+            data={},
+            stdout="{}",
+        )
+
+        _call_scan_prompt_daemon("hello", "standard", "user_input")
+
+        self.assertEqual(
+            mock_client.call.call_args.kwargs["trace_context"],
+            {"trace_id": "trace-1", "run_id": "run-1", "agent_name": "hermes"},
         )
 
 
@@ -489,3 +755,212 @@ class TestCliAuditIntegration(unittest.TestCase):
         # The verdict in the output should reflect the threat
         data = json.loads(out.stdout)
         self.assertEqual(data["verdict"], "deny")
+
+
+# ---------------------------------------------------------------------------
+# Tests: multi_turn mode (L4)
+# ---------------------------------------------------------------------------
+
+
+class TestCliMultiTurnMode(unittest.TestCase):
+    """Tests for the MULTI_TURN mode CLI path.
+
+    Multi_turn reads a JSON payload from stdin and calls invoke() directly
+    (bypassing the daemon).  These tests cover the full multi_turn code path.
+    """
+
+    def _payload(self, **overrides) -> str:
+        data = {
+            "history": [{"role": "user", "content": "hi"}],
+            "current_query": "hello",
+            "assistant_response": "world",
+        }
+        data.update(overrides)
+        return json.dumps(data)
+
+    def _mock_multi_turn_invoke(self, result: ScanResult, **kwargs):
+        """Patch invoke for multi_turn mode and return the mock."""
+        d = result.to_dict()
+        mw_result = ActionResult(
+            success=(result.verdict != Verdict.ERROR),
+            data=kwargs.get("data", d),
+            stdout=kwargs.get("stdout", json.dumps(d, indent=2, ensure_ascii=False)),
+            error=kwargs.get("error", ""),
+            exit_code=kwargs.get("exit_code", 0),
+        )
+        return patch(
+            "agent_sec_cli.prompt_scanner.cli.invoke",
+            return_value=mw_result,
+        )
+
+    # --- --text / --input rejected in multi_turn ---
+
+    def test_text_flag_rejected_in_multi_turn(self) -> None:
+        out = runner.invoke(
+            scanner_app,
+            ["--mode", "multi_turn", "--text", "hello"],
+        )
+        self.assertEqual(out.exit_code, 1)
+        self.assertIn("not supported", out.stderr)
+
+    def test_input_flag_rejected_in_multi_turn(self) -> None:
+        out = runner.invoke(
+            scanner_app,
+            ["--mode", "multi_turn", "--input", "/tmp/foo.txt"],
+        )
+        self.assertEqual(out.exit_code, 1)
+        self.assertIn("not supported", out.stderr)
+
+    # --- stdin errors ---
+
+    def test_empty_stdin_in_multi_turn(self) -> None:
+        out = runner.invoke(scanner_app, ["--mode", "multi_turn"], input="")
+        self.assertEqual(out.exit_code, 1)
+        self.assertIn("No input", out.stderr)
+
+    def test_invalid_json_in_multi_turn(self) -> None:
+        out = runner.invoke(
+            scanner_app,
+            ["--mode", "multi_turn"],
+            input="not valid json {{{",
+        )
+        self.assertEqual(out.exit_code, 1)
+        self.assertIn("Invalid JSON", out.stderr)
+
+    # --- payload validation ---
+
+    def test_history_not_list_rejected(self) -> None:
+        payload = json.dumps(
+            {
+                "history": "not a list",
+                "current_query": "hello",
+                "assistant_response": "world",
+            }
+        )
+        out = runner.invoke(scanner_app, ["--mode", "multi_turn"], input=payload)
+        self.assertEqual(out.exit_code, 1)
+        self.assertIn("history", out.stderr.lower())
+
+    def test_current_query_not_string_rejected(self) -> None:
+        payload = json.dumps(
+            {
+                "history": [],
+                "current_query": 123,
+                "assistant_response": "world",
+            }
+        )
+        out = runner.invoke(scanner_app, ["--mode", "multi_turn"], input=payload)
+        self.assertEqual(out.exit_code, 1)
+        self.assertIn("current_query", out.stderr.lower())
+
+    def test_empty_current_query_rejected(self) -> None:
+        payload = json.dumps(
+            {
+                "history": [],
+                "current_query": "   ",
+                "assistant_response": "world",
+            }
+        )
+        out = runner.invoke(scanner_app, ["--mode", "multi_turn"], input=payload)
+        self.assertEqual(out.exit_code, 1)
+        self.assertIn("empty", out.stderr.lower())
+
+    # --- successful multi_turn scan (JSON output) ---
+
+    def test_multi_turn_json_output(self) -> None:
+        result = _make_scan_result()
+        with self._mock_multi_turn_invoke(result) as mock_invoke:
+            out = runner.invoke(
+                scanner_app,
+                ["--mode", "multi_turn"],
+                input=self._payload(),
+            )
+        self.assertEqual(out.exit_code, 0)
+        mock_invoke.assert_called_once_with(
+            "prompt_scan",
+            text="hello",
+            mode="multi_turn",
+            source="",
+            history=[{"role": "user", "content": "hi"}],
+            assistant_response="world",
+        )
+        parsed = json.loads(out.stdout)
+        self.assertEqual(parsed["verdict"], "pass")
+
+    # --- successful multi_turn scan (text output) ---
+
+    def test_multi_turn_text_output(self) -> None:
+        result = _make_scan_result()
+        with self._mock_multi_turn_invoke(result):
+            out = runner.invoke(
+                scanner_app,
+                ["--mode", "multi_turn", "--format", "text"],
+                input=self._payload(),
+            )
+        self.assertEqual(out.exit_code, 0)
+        self.assertIn("Verdict", out.stdout)
+        self.assertIn("PASS", out.stdout)
+
+    # --- invoke exception → ERROR JSON ---
+
+    def test_multi_turn_invoke_exception(self) -> None:
+        with patch(
+            "agent_sec_cli.prompt_scanner.cli.invoke",
+            side_effect=RuntimeError("scanner crashed"),
+        ):
+            out = runner.invoke(
+                scanner_app,
+                ["--mode", "multi_turn"],
+                input=self._payload(),
+            )
+        self.assertEqual(out.exit_code, 1)
+        parsed = json.loads(out.stdout)
+        self.assertEqual(parsed["verdict"], "error")
+        self.assertIn("scanner crashed", parsed["summary"])
+
+    # --- L4 unavailable warning ---
+
+    def test_multi_turn_warns_when_l4_unavailable(self) -> None:
+        result = _make_scan_result()
+        d = result.to_dict()
+        # Simulate L4 not running: layer_results is empty
+        d["layer_results"] = []
+        mw_result = ActionResult(
+            success=True,
+            data=d,
+            stdout=json.dumps(d, indent=2, ensure_ascii=False),
+            exit_code=0,
+        )
+        with patch(
+            "agent_sec_cli.prompt_scanner.cli.invoke",
+            return_value=mw_result,
+        ):
+            out = runner.invoke(
+                scanner_app,
+                ["--mode", "multi_turn"],
+                input=self._payload(),
+            )
+        self.assertEqual(out.exit_code, 0)
+        self.assertIn("not available", out.stderr.lower())
+
+    # --- text output when mw_result.data is None ---
+
+    def test_multi_turn_text_output_error_when_no_data(self) -> None:
+        mw_result = ActionResult(
+            success=False,
+            data=None,
+            stdout="",
+            error="scan failed",
+            exit_code=1,
+        )
+        with patch(
+            "agent_sec_cli.prompt_scanner.cli.invoke",
+            return_value=mw_result,
+        ):
+            out = runner.invoke(
+                scanner_app,
+                ["--mode", "multi_turn", "--format", "text"],
+                input=self._payload(),
+            )
+        self.assertEqual(out.exit_code, 1)
+        self.assertIn("scan failed", out.stderr)

@@ -21,6 +21,15 @@ use std::path::{Path, PathBuf};
 
 /// Application namespace folder appended to most FHS / file-hierarchy roots.
 const NS: &str = "anolisa";
+/// Subdirectory under `datadir` where package-owned component contracts
+/// are installed (e.g. `{datadir}/components/<component>/component.toml`).
+const COMPONENTS_SUBDIR: &str = "components";
+/// Subdirectory under `state_dir` where ANOLISA stores its runtime copy of
+/// component contracts after install/adopt.
+const COMPONENT_MANIFESTS_SUBDIR: &str = "component-manifests";
+/// Filename used for both the package-owned component contract and the
+/// runtime state snapshot.
+const COMPONENT_MANIFEST_FILE: &str = "component.toml";
 /// Audit-log file name written under `log_dir`.
 const CENTRAL_LOG_NAME: &str = "central.jsonl";
 /// Lock file name written under `state_dir`.
@@ -39,12 +48,22 @@ mod fhs {
     pub const LIB: &str = "/usr/local/lib/anolisa";
     pub const LIBEXEC: &str = "/usr/local/libexec/anolisa";
     pub const DATADIR: &str = "/usr/local/share/anolisa";
+    /// FHS package-managed read-only datadir. RPM/DEB packages install
+    /// component contracts and adapter resources here, separate from the
+    /// `/usr/local` tree used by raw/tar installs.
+    pub const PACKAGE_DATADIR: &str = "/usr/share/anolisa";
     pub const ETC: &str = "/etc/anolisa";
     pub const STATE: &str = "/var/lib/anolisa";
     pub const CACHE: &str = "/var/cache/anolisa";
     pub const LOG: &str = "/var/log/anolisa";
     pub const RUNTIME: &str = "/run/anolisa";
-    pub const SYSTEMD_UNITS: &str = "/etc/systemd/system";
+    pub const SYSTEMD_UNITS: &str = "/usr/local/lib/systemd/system";
+    /// System-wide *user* unit search dir. Per-user template units
+    /// (`foo@.service` driven by `systemctl --user`) install here so every
+    /// user's manager can find them — the `/usr/local` analogue of the
+    /// distro `/usr/lib/systemd/user`. Distinct from [`SYSTEMD_UNITS`],
+    /// which holds system-manager units.
+    pub const SYSTEMD_USER_UNITS: &str = "/usr/local/lib/systemd/user";
 }
 
 // ---- User-mode (file-hierarchy(7)) leaf names ---------------------------
@@ -132,8 +151,16 @@ pub struct FsLayout {
     pub runtime_dir: PathBuf,
     /// Catalog overlay directory for this install mode.
     pub manifests_overlay: PathBuf,
-    /// Distribution-specific systemd unit search directory.
+    /// Distribution-specific systemd *system* unit search directory.
+    /// Targets system-scope units (`{unitdir}` placeholder).
     pub systemd_unit_dir: PathBuf,
+    /// Systemd *user* unit search directory (`{userunitdir}` placeholder).
+    /// Targets user-scope template units. In system mode this is the
+    /// system-wide user-unit dir (`/usr/local/lib/systemd/user`); in user
+    /// mode it coincides with [`systemd_unit_dir`](Self::systemd_unit_dir)
+    /// at `~/.config/systemd/user`, since a user install has no
+    /// system-manager units.
+    pub systemd_user_unit_dir: PathBuf,
 }
 
 impl FsLayout {
@@ -170,6 +197,7 @@ impl FsLayout {
             runtime_dir: rebase(fhs::RUNTIME),
             manifests_overlay,
             systemd_unit_dir: rebase(fhs::SYSTEMD_UNITS),
+            systemd_user_unit_dir: rebase(fhs::SYSTEMD_USER_UNITS),
             prefix,
         }
     }
@@ -201,7 +229,7 @@ impl FsLayout {
     ///
     /// Each `Option` is one home-root override; `None` selects the
     /// `$HOME`-based home root that `file-hierarchy(7)` defines.
-    pub(crate) fn user_with_overrides(
+    pub fn user_with_overrides(
         home: PathBuf,
         data_override: Option<PathBuf>,
         config_override: Option<PathBuf>,
@@ -247,7 +275,10 @@ impl FsLayout {
             .unwrap_or_else(|| state_dir.join(fh_user::RUNTIME_FALLBACK_SUB));
 
         let manifests_overlay = etc_dir.join(OVERLAY_NAME);
+        // A user install has no system-manager units, so the system and
+        // user unit dirs coincide at `~/.config/systemd/user`.
         let systemd_unit_dir = config.join(fh_user::SYSTEMD_USER_SUB);
+        let systemd_user_unit_dir = systemd_unit_dir.clone();
 
         Self {
             mode: InstallMode::User,
@@ -268,7 +299,76 @@ impl FsLayout {
             runtime_dir,
             manifests_overlay,
             systemd_unit_dir,
+            systemd_user_unit_dir,
         }
+    }
+
+    /// Package-owned component contract path under this layout's datadir:
+    /// `{datadir}/components/<component>/component.toml`.
+    ///
+    /// RPM packages and raw archives install the ANOLISA component
+    /// contract at this location. The path derives from [`Self::datadir`],
+    /// so it respects system-mode prefixes and user-mode XDG overrides.
+    pub fn contract_path(&self, component: &str) -> PathBuf {
+        Self::component_contract_path(&self.datadir, component)
+    }
+
+    /// Installed-state snapshot path under this layout's state_dir:
+    /// `{state_dir}/component-manifests/<component>/component.toml`.
+    ///
+    /// ANOLISA copies the resolved contract into this location after
+    /// install or adopt. Commands such as `adapter enable` read from here
+    /// first, falling back to the package-owned contract when absent.
+    pub fn snapshot_path(&self, component: &str) -> PathBuf {
+        Self::component_manifest_snapshot_path(&self.state_dir, component)
+    }
+
+    /// FHS package-managed read-only datadir (`/usr/share/anolisa`),
+    /// rebased under the same prefix as the rest of the system layout.
+    ///
+    /// RPM/DEB packages install component contracts and adapter resources
+    /// under this path. It is separate from [`Self::datadir`]
+    /// (`/usr/local/share/anolisa`) because FHS reserves `/usr/local` for
+    /// locally-installed software and `/usr/share` for
+    /// distribution-packaged read-only data.
+    ///
+    /// Returns `None` in user mode (user-mode installs never consult the
+    /// FHS package tree) or when the result would equal `self.datadir`
+    /// (a custom prefix can collapse the two).
+    pub fn package_datadir(&self) -> Option<PathBuf> {
+        match self.mode {
+            InstallMode::System => {
+                let path = rebase_under(&self.prefix, fhs::PACKAGE_DATADIR);
+                if path != self.datadir {
+                    Some(path)
+                } else {
+                    None
+                }
+            }
+            InstallMode::User => None,
+        }
+    }
+
+    /// Package-owned component contract path under an arbitrary datadir root.
+    ///
+    /// Use this when computing candidates across multiple roots; for a
+    /// single layout prefer [`Self::contract_path`].
+    pub fn component_contract_path(datadir_root: &Path, component: &str) -> PathBuf {
+        datadir_root
+            .join(COMPONENTS_SUBDIR)
+            .join(component)
+            .join(COMPONENT_MANIFEST_FILE)
+    }
+
+    /// Installed-state snapshot path under an arbitrary state root.
+    ///
+    /// Use this when computing candidates across multiple roots; for a
+    /// single layout prefer [`Self::snapshot_path`].
+    pub fn component_manifest_snapshot_path(state_root: &Path, component: &str) -> PathBuf {
+        state_root
+            .join(COMPONENT_MANIFESTS_SUBDIR)
+            .join(component)
+            .join(COMPONENT_MANIFEST_FILE)
     }
 }
 
@@ -325,7 +425,11 @@ mod tests {
         assert_eq!(layout.runtime_dir, PathBuf::from("/run/anolisa"));
         assert_eq!(
             layout.systemd_unit_dir,
-            PathBuf::from("/etc/systemd/system")
+            PathBuf::from("/usr/local/lib/systemd/system")
+        );
+        assert_eq!(
+            layout.systemd_user_unit_dir,
+            PathBuf::from("/usr/local/lib/systemd/user")
         );
         assert_eq!(
             layout.central_log,
@@ -369,7 +473,11 @@ mod tests {
         assert_eq!(layout.runtime_dir, PathBuf::from("/opt/x/run/anolisa"));
         assert_eq!(
             layout.systemd_unit_dir,
-            PathBuf::from("/opt/x/etc/systemd/system")
+            PathBuf::from("/opt/x/usr/local/lib/systemd/system")
+        );
+        assert_eq!(
+            layout.systemd_user_unit_dir,
+            PathBuf::from("/opt/x/usr/local/lib/systemd/user")
         );
     }
 
@@ -424,6 +532,11 @@ mod tests {
             layout.systemd_unit_dir,
             PathBuf::from("/tmp/h/.config/systemd/user")
         );
+        // User mode has no system-manager units: both unit dirs coincide.
+        assert_eq!(
+            layout.systemd_user_unit_dir,
+            PathBuf::from("/tmp/h/.config/systemd/user")
+        );
     }
 
     #[test]
@@ -445,6 +558,10 @@ mod tests {
         assert_eq!(layout.lock_file, PathBuf::from("/state/anolisa/lock"));
         assert_eq!(layout.runtime_dir, PathBuf::from("/run/user/1000/anolisa"));
         assert_eq!(layout.systemd_unit_dir, PathBuf::from("/conf/systemd/user"));
+        assert_eq!(
+            layout.systemd_user_unit_dir,
+            PathBuf::from("/conf/systemd/user")
+        );
         // bin/lib/libexec are HOME-rooted regardless of the data-root
         // override: file-hierarchy(7) places them under ~/.local/bin and
         // ~/.local/lib, decoupled from the data root.
@@ -538,6 +655,146 @@ mod tests {
         assert_eq!(
             with_runtime.runtime_dir,
             PathBuf::from("/run/user/42/anolisa")
+        );
+    }
+
+    // ---- component contract paths ----------------------------------------
+
+    #[test]
+    fn system_component_contract_path_derives_from_datadir() {
+        let layout = FsLayout::system(None);
+        assert_eq!(
+            layout.contract_path("sec-core"),
+            PathBuf::from("/usr/local/share/anolisa/components/sec-core/component.toml")
+        );
+    }
+
+    #[test]
+    fn system_component_manifest_snapshot_path_derives_from_state_dir() {
+        let layout = FsLayout::system(None);
+        assert_eq!(
+            layout.snapshot_path("sec-core"),
+            PathBuf::from("/var/lib/anolisa/component-manifests/sec-core/component.toml")
+        );
+    }
+
+    #[test]
+    fn system_component_contract_path_with_prefix() {
+        let layout = FsLayout::system(Some(PathBuf::from("/opt/x")));
+        assert_eq!(
+            layout.contract_path("tokenless"),
+            PathBuf::from("/opt/x/usr/local/share/anolisa/components/tokenless/component.toml")
+        );
+        assert_eq!(
+            layout.snapshot_path("tokenless"),
+            PathBuf::from("/opt/x/var/lib/anolisa/component-manifests/tokenless/component.toml")
+        );
+    }
+
+    #[test]
+    fn user_component_contract_path_derives_from_datadir() {
+        let layout = user_no_overrides("/tmp/h");
+        assert_eq!(
+            layout.contract_path("os-skills"),
+            PathBuf::from("/tmp/h/.local/share/anolisa/components/os-skills/component.toml")
+        );
+    }
+
+    #[test]
+    fn user_component_manifest_snapshot_path_derives_from_state_dir() {
+        let layout = user_no_overrides("/tmp/h");
+        assert_eq!(
+            layout.snapshot_path("os-skills"),
+            PathBuf::from(
+                "/tmp/h/.local/state/anolisa/component-manifests/os-skills/component.toml"
+            )
+        );
+    }
+
+    // ---- package_datadir ----------------------------------------------------
+
+    #[test]
+    fn system_layout_keeps_local_datadir() {
+        let layout = FsLayout::system(None);
+        assert_eq!(
+            layout.datadir,
+            PathBuf::from("/usr/local/share/anolisa"),
+            "system datadir must remain /usr/local/share/anolisa for raw/tar installs"
+        );
+        let pkg = layout.package_datadir();
+        assert_eq!(
+            pkg,
+            Some(PathBuf::from("/usr/share/anolisa")),
+            "package_datadir must be /usr/share/anolisa, distinct from datadir"
+        );
+        assert_ne!(
+            layout.datadir,
+            pkg.unwrap(),
+            "package_datadir must not equal the primary datadir"
+        );
+    }
+
+    #[test]
+    fn package_datadir_respects_prefix() {
+        let layout = FsLayout::system(Some(PathBuf::from("/opt/x")));
+        assert_eq!(
+            layout.datadir,
+            PathBuf::from("/opt/x/usr/local/share/anolisa")
+        );
+        assert_eq!(
+            layout.package_datadir(),
+            Some(PathBuf::from("/opt/x/usr/share/anolisa"))
+        );
+    }
+
+    #[test]
+    fn package_datadir_is_none_for_user_mode() {
+        let layout = user_no_overrides("/tmp/h");
+        assert_eq!(
+            layout.package_datadir(),
+            None,
+            "user mode must not expose a package_datadir"
+        );
+    }
+
+    #[test]
+    fn package_contract_does_not_change_raw_install_target() {
+        let layout = FsLayout::system(None);
+        assert_eq!(
+            layout.datadir,
+            PathBuf::from("/usr/local/share/anolisa"),
+            "raw/system install datadir must remain /usr/local/share/anolisa"
+        );
+        assert_eq!(
+            layout.contract_path("sec-core"),
+            PathBuf::from("/usr/local/share/anolisa/components/sec-core/component.toml"),
+            "contract_path must derive from the primary (local-install) datadir"
+        );
+        let pkg = layout.package_datadir().unwrap();
+        assert_eq!(
+            FsLayout::component_contract_path(&pkg, "sec-core"),
+            PathBuf::from("/usr/share/anolisa/components/sec-core/component.toml"),
+            "package contract path must be under /usr/share/anolisa"
+        );
+    }
+
+    #[test]
+    fn user_component_contract_path_honors_xdg_overrides() {
+        let layout = FsLayout::user_with_overrides(
+            PathBuf::from("/tmp/h"),
+            Some(PathBuf::from("/data")),
+            None,
+            Some(PathBuf::from("/state")),
+            None,
+            None,
+        );
+        assert_eq!(
+            layout.contract_path("sec-core"),
+            PathBuf::from("/data/anolisa/components/sec-core/component.toml")
+        );
+        assert_eq!(
+            layout.snapshot_path("sec-core"),
+            PathBuf::from("/state/anolisa/component-manifests/sec-core/component.toml")
         );
     }
 }

@@ -6,12 +6,17 @@ from pathlib import Path
 from typing import Any
 
 import typer
-from agent_sec_cli.correlation_context import get_current_trace_context
+from agent_sec_cli.correlation_context import (
+    get_current_trace_context,
+    trace_context_to_payload,
+)
 from agent_sec_cli.daemon.client import DaemonClient
+from agent_sec_cli.daemon.env import daemon_disabled
 from agent_sec_cli.daemon.protocol import DaemonResponse
 from agent_sec_cli.prompt_scanner.config import ScanMode
 from agent_sec_cli.prompt_scanner.result import Verdict
 from agent_sec_cli.prompt_scanner.scanner import PromptScanner
+from agent_sec_cli.security_middleware import invoke
 
 scanner_app = typer.Typer(
     name="scan-prompt", help="Prompt injection / jailbreak scanner"
@@ -68,7 +73,7 @@ def scan_prompt(
     mode: str = typer.Option(
         "standard",
         "--mode",
-        help="Detection mode: fast (L1), standard (L1+L2), strict (L1+L2+L3)",
+        help="Detection mode: fast (L1), standard (L1+L2), strict (L1+L2+L3), multi_turn (L4, reads JSON from stdin)",
         case_sensitive=False,
     ),
     output_format: str = typer.Option(
@@ -107,6 +112,12 @@ def scan_prompt(
 
     Input priority: --text > --input <file> > stdin
 
+    For multi_turn (L4) mode, pipe a JSON payload via stdin with
+    {history, current_query, assistant_response}:
+
+        echo '{"history":[...],"current_query":"...","assistant_response":"..."}' | \\
+            agent-sec-cli scan-prompt --mode multi_turn
+
     Examples::
 
         # Direct text
@@ -129,11 +140,11 @@ def scan_prompt(
         scan_mode = ScanMode(mode.lower())
     except ValueError:
         typer.echo(
-            f"Error: Invalid mode '{mode}'. Choose from: fast, standard, strict",
+            f"Error: Invalid mode '{mode}'. "
+            "Choose from: fast, standard, strict, multi_turn",
             err=True,
         )
         raise typer.Exit(code=1)
-
     # --- Validate format ---
     if output_format not in ("json", "text"):
         typer.echo(
@@ -142,10 +153,91 @@ def scan_prompt(
         )
         raise typer.Exit(code=1)
 
+    # --- MULTI_TURN mode: read JSON payload from stdin ---
+    # L4 always invokes locally: it calls Ollama over HTTP directly, so the
+    # daemon's L2 model pre-load gives no benefit, and the daemon's
+    # prompt_scan_state readiness gate would reject a mode that doesn't need
+    # the L2 model.  Audit parity is preserved — the local invoke() path
+    # emits the same prompt_scan SecurityEvent as the daemon-disabled L1-L3
+    # path (only the daemon access_log is skipped, identical to running with
+    # AGENT_SEC_DAEMON_DISABLED=1).
+    if scan_mode is ScanMode.MULTI_TURN:
+        if text is not None or input_file:
+            typer.echo(
+                "Error: --text and --input are not supported with multi_turn mode. "
+                "Pipe a JSON payload via stdin:\n"
+                '  echo \'{"history":[...],"current_query":"...","assistant_response":"..."}\' | '
+                "agent-sec-cli scan-prompt --mode multi_turn",
+                err=True,
+            )
+            raise typer.Exit(code=1)
+
+        raw = sys.stdin.read().strip()
+        if not raw:
+            typer.echo("Error: No input received from stdin.", err=True)
+            raise typer.Exit(code=1)
+        try:
+            payload = json.loads(raw)
+        except (json.JSONDecodeError, ValueError) as exc:
+            typer.echo(f"Error: Invalid JSON: {exc}", err=True)
+            raise typer.Exit(code=1)
+
+        history = payload.get("history") or []
+        current_query = payload.get("current_query") or ""
+        assistant_response = payload.get("assistant_response") or ""
+        if not isinstance(history, list) or not isinstance(current_query, str):
+            typer.echo(
+                "Error: payload must include a 'history' list and 'current_query' string.",
+                err=True,
+            )
+            raise typer.Exit(code=1)
+        if not current_query.strip():
+            typer.echo("Error: current_query is empty.", err=True)
+            raise typer.Exit(code=1)
+
+        try:
+            mw_result = invoke(
+                "prompt_scan",
+                text=current_query,
+                mode=scan_mode.value,
+                source=source,
+                history=history,
+                assistant_response=assistant_response,
+            )
+        except Exception as exc:
+            typer.echo(
+                json.dumps(
+                    _build_error_output(f"Scanner error: {exc}"),
+                    indent=2,
+                    ensure_ascii=False,
+                )
+            )
+            raise typer.Exit(code=1)
+
+        # Warn when L4 is unavailable — the scan passes through with no
+        # detectors having run (MULTI_TURN mode only configures L4).
+        if mw_result.data and not mw_result.data.get("layer_results"):
+            typer.echo(
+                "Warning: L4 multi-turn intent detection is not available "
+                "(Ollama unreachable). Scan returned a pass-through verdict.",
+                err=True,
+            )
+
+        if output_format == "text":
+            if not mw_result.data:
+                typer.echo(f"Error: {mw_result.error}", err=True)
+                raise typer.Exit(code=mw_result.exit_code)
+            _print_text(mw_result.data)
+        else:
+            typer.echo(mw_result.stdout)
+        raise typer.Exit(code=0)
+
     # --- Read input texts ---
     texts: list[str]
     if text is not None:
         # --text flag takes precedence
+        if not text.strip():
+            raise typer.Exit(code=0)
         texts = [text]
     elif input_file:
         try:
@@ -164,9 +256,11 @@ def scan_prompt(
             raise typer.Exit(code=1)
         texts = [raw]
 
-    # --- Scan through daemon (daemon owns prompt model runtime and audit writes) ---
+    use_daemon = _should_use_daemon()
+
+    # --- Scan through daemon unless explicitly disabled, otherwise use local middleware ---
     # Each text is scanned individually so that every invocation gets its own
-    # daemon request and SecurityEvent record.  This ensures precise per-input
+    # daemon request or local SecurityEvent record.  This ensures precise per-input
     # auditability: when a threat is detected, the audit log pinpoints exactly
     # which input triggered it.  Batching would collapse multiple inputs into a
     # single trace_id, losing that granularity without any performance benefit:
@@ -174,36 +268,46 @@ def scan_prompt(
     # HuggingFace tokenizer (Rust-backed, uses RefCell internally) is NOT
     # thread-safe — all inference is serialised behind _inference_lock.
     for t in texts:
-        try:
-            response = _call_scan_prompt_daemon(t, scan_mode.value, source)
-        except Exception as exc:
-            _print_error_json(_daemon_unavailable_message(str(exc)))
-            raise typer.Exit(code=0)
+        if use_daemon:
+            try:
+                response = _call_scan_prompt_daemon(t, scan_mode.value, source)
+            except Exception as exc:
+                _print_error_json(_daemon_unavailable_message(str(exc)))
+                raise typer.Exit(code=0)
 
-        if not response.ok:
-            _print_error_json(response.stderr or _daemon_error_message(response))
+            if not response.ok:
+                _print_error_json(response.stderr or _daemon_error_message(response))
+                raise typer.Exit(code=0)
+
+            daemon_exit_code = _print_daemon_response(response, output_format)
+            if daemon_exit_code:
+                raise typer.Exit(code=daemon_exit_code)
+            continue
+
+        try:
+            mw_result = invoke(
+                "prompt_scan",
+                text=t,
+                mode=scan_mode.value,
+                source=source,
+            )
+        except Exception as exc:
+            _print_error_json(f"Scanner error: {exc}")
             raise typer.Exit(code=0)
 
         # --- Output ---
         if output_format == "text":
-            if response.data:
-                _print_text(response.data)
-            else:
-                typer.echo(
-                    f"Error: {response.stderr or 'scan-prompt returned no result data'}",
-                    err=True,
-                )
-                raise typer.Exit(code=response.exit_code or 1)
+            if not mw_result.data:
+                typer.echo(f"Error: {mw_result.error}", err=True)
+                raise typer.Exit(code=mw_result.exit_code or 1)
+            _print_text(mw_result.data)
         else:
-            if response.stdout:
-                typer.echo(response.stdout)
-            elif response.data:
-                typer.echo(json.dumps(response.data, indent=2, ensure_ascii=False))
+            if mw_result.stdout:
+                typer.echo(mw_result.stdout)
+            elif mw_result.data:
+                typer.echo(json.dumps(mw_result.data, indent=2, ensure_ascii=False))
             else:
-                _print_error_json(
-                    response.stderr
-                    or f"scan-prompt returned no output (exit code {response.exit_code})"
-                )
+                _print_error_json(mw_result.error or "scan-prompt returned no output")
 
     raise typer.Exit(code=0)
 
@@ -217,28 +321,15 @@ def _call_scan_prompt_daemon(
     return DaemonClient(timeout_ms=DAEMON_REQUEST_TIMEOUT_MS).call(
         "scan-prompt",
         params={"text": text, "mode": mode, "source": source},
-        trace_context=_current_trace_context_payload(),
+        trace_context=trace_context_to_payload(get_current_trace_context()),
+        caller="cli",
         timeout_ms=DAEMON_REQUEST_TIMEOUT_MS,
     )
 
 
-def _current_trace_context_payload() -> dict[str, str]:
-    ctx = get_current_trace_context()
-    if ctx is None:
-        return {}
-
-    payload: dict[str, str] = {}
-    for field_name in (
-        "trace_id",
-        "session_id",
-        "run_id",
-        "call_id",
-        "tool_call_id",
-    ):
-        value = getattr(ctx, field_name)
-        if value is not None:
-            payload[field_name] = value
-    return payload
+def _should_use_daemon() -> bool:
+    """Return whether the CLI should try the daemon path for scan-prompt."""
+    return not daemon_disabled()
 
 
 def _daemon_unavailable_message(detail: str) -> str:
@@ -256,6 +347,30 @@ def _daemon_error_message(response: DaemonResponse) -> str:
 def _print_error_json(message: str) -> None:
     """Print a scanner-compatible ERROR verdict payload."""
     typer.echo(json.dumps(_build_error_output(message), indent=2, ensure_ascii=False))
+
+
+def _print_daemon_response(response: DaemonResponse, output_format: str) -> int:
+    """Print a successful daemon scan-prompt response and return a CLI exit code."""
+    if output_format == "text":
+        if response.data:
+            _print_text(response.data)
+            return 0
+        typer.echo(
+            f"Error: {response.stderr or 'scan-prompt returned no result data'}",
+            err=True,
+        )
+        return response.exit_code or 1
+
+    if response.stdout:
+        typer.echo(response.stdout)
+    elif response.data:
+        typer.echo(json.dumps(response.data, indent=2, ensure_ascii=False))
+    else:
+        _print_error_json(
+            response.stderr
+            or f"scan-prompt returned no output (exit code {response.exit_code})"
+        )
+    return 0
 
 
 def _print_text(d: dict[str, Any]) -> None:

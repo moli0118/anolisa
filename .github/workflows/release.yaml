@@ -10,6 +10,7 @@ on:
       - 'tokenless/v*'
       - 'ckpt/v*'
       - 'memory/v*'
+      - 'skillfs/v*'
 
 permissions:
   contents: write
@@ -22,7 +23,7 @@ jobs:
   # =========================================================================
   package:
     name: Package ${{ github.ref_name }}
-    runs-on: [self-hosted, ubuntu]
+    runs-on: ubuntu-22.04
     outputs:
       component: ${{ steps.parse.outputs.component }}
       version: ${{ steps.parse.outputs.version }}
@@ -49,6 +50,7 @@ jobs:
             tokenless) COMPONENT="tokenless" ;;
             ckpt)     COMPONENT="ws-ckpt" ;;
             memory)   COMPONENT="agent-memory" ;;
+            skillfs)  COMPONENT="skillfs" ;;
             *)
               echo "Unknown scope: $SCOPE"
               exit 1
@@ -94,7 +96,7 @@ jobs:
     name: Publish ${{ needs.package.outputs.tag }}
     needs: package
     environment: release
-    runs-on: [self-hosted, ubuntu]
+    runs-on: ubuntu-22.04
     steps:
       - uses: actions/checkout@v4
         with:
@@ -146,6 +148,7 @@ jobs:
             tokenless)      PREFIX="tokenless/v" ;;
             ws-ckpt)        PREFIX="ckpt/v" ;;
             agent-memory)   PREFIX="memory/v" ;;
+            skillfs)        PREFIX="skillfs/v" ;;
           esac
 
           PREV_TAG=$(git tag --list "${PREFIX}*" --sort=-version:refname | grep -v "^${TAG}$" | head -1)

@@ -69,9 +69,10 @@ SkillFS 预期处理：
 
 Skill Ledger 不提供面向用户或 SkillFS 的 `resolve` CLI。activation refresh 是 Skill Ledger daemon 的内部职责；daemon 内部调用 resolver 后，同步写入 `activation.json` 与 xattr。SkillFS 只依赖 Runtime Activation 合同中的 `schemaVersion` 和 `target`，不得依赖 resolver 的内部返回值。
 
-## 变更通知接口
+## SkillFS 变更通知接口
 
-本次 Skill Ledger 实现只落地内部 resolver 与 Runtime Activation 合同，不实现 SkillFS 联调。后续 daemon 模式中，SkillFS 发现 source/current workspace 写变化后，应通过现有 `agent-sec-daemon` 协议通知 Skill Ledger daemon。
+SkillFS 发现 source/current workspace 写变化后，通过现有 `agent-sec-daemon` 协议通知 Skill Ledger daemon。本接口已经由 Skill Ledger 侧实现；SkillFS 侧只需要按该协议发送事件。
+启动或重启后，SkillFS 也可以对已加载的普通 skill 发送 `eventKind="reconcile"`、`paths=[]`，请求 Ledger 以当前磁盘状态重新对齐扫描与 activation。
 
 传输形式固定为当前 `agent-sec-daemon` 机制：
 
@@ -81,7 +82,7 @@ Skill Ledger 不提供面向用户或 SkillFS 的 `resolve` CLI。activation ref
 - request/response 外层遵循现有 daemon protocol：`id`、`method`、`params`、`trace_context`、`timeout_ms`。
 - method 必须注册到 daemon allowlist；未注册 method 会返回 structured error。
 
-推荐 method：
+method 固定为：
 
 ```text
 skill_ledger.skillfs_notify_change
@@ -105,6 +106,24 @@ skill_ledger.skillfs_notify_change
 }
 ```
 
+启动对齐请求示例：
+
+```json
+{
+  "id": "skillfs-01HY...",
+  "method": "skill_ledger.skillfs_notify_change",
+  "params": {
+    "schemaVersion": 1,
+    "skillDir": "/path/to/source/tianqi-weather",
+    "skillName": "tianqi-weather",
+    "eventKind": "reconcile",
+    "paths": []
+  },
+  "trace_context": {},
+  "timeout_ms": 5000
+}
+```
+
 外层字段说明：
 
 | 字段 | 类型 | 枚举 / 约束 | 说明 |
@@ -120,10 +139,10 @@ skill_ledger.skillfs_notify_change
 | 字段 | 类型 | 枚举 / 约束 | 说明 |
 | --- | --- | --- | --- |
 | `schemaVersion` | number | `1` | 当前固定为 `1` |
-| `skillDir` | string | 绝对路径 | source/current workspace 中的 skill 根目录 |
+| `skillDir` | string | 绝对路径；不支持 `~` 展开 | source/current workspace 中的 skill 根目录 |
 | `skillName` | string | 非空字符串 | skill 名称；应与 `skillDir` basename 一致 |
-| `eventKind` | string | `mkdir` / `create` / `write` / `rename` / `unlink` / `rmdir` / `truncate` / `chmod` / `chown` / `unknown` | SkillFS 观察到的文件系统变化类型 |
-| `paths` | string[] | 相对 `skillDir` 的路径数组，可为空 | 触发变化的相对路径；不得包含 `.skill-meta/**` |
+| `eventKind` | string | `mkdir` / `create` / `write` / `rename` / `unlink` / `rmdir` / `setattr` / `truncate` / `reconcile` | SkillFS 观察到的文件系统变化类型；`reconcile` 表示启动后状态对齐，不代表具体文件操作 |
+| `paths` | string[] | 相对 `skillDir` 的路径数组，可为空；不得是绝对路径，不得包含 `..` | 触发变化的相对路径 |
 
 响应示例：
 
@@ -133,7 +152,10 @@ skill_ledger.skillfs_notify_change
   "ok": true,
   "data": {
     "schemaVersion": 1,
-    "accepted": true
+    "accepted": true,
+    "ignored": false,
+    "queued": true,
+    "coalesced": false
   },
   "stdout": "",
   "stderr": "",
@@ -148,22 +170,30 @@ skill_ledger.skillfs_notify_change
 | `ok` | boolean | `true` / `false` | daemon 是否成功处理该请求 |
 | `data.schemaVersion` | number | `1` | 当前固定为 `1` |
 | `data.accepted` | boolean | `true` / `false` | 事件是否被接收或入队 |
+| `data.ignored` | boolean | `true` / `false` | 是否因仅包含 `.skill-meta/**` 路径而忽略 |
+| `data.queued` | boolean | `true` / `false` | 是否进入后台 activation job 队列；`ignored=true` 时不存在或为 `false` |
+| `data.coalesced` | boolean | `true` / `false` | 是否与同一 skill 的待处理事件合并 |
 | `exit_code` | number | `0` 表示请求成功 | 复用现有 daemon response 语义 |
 | `error.code` | string | 现有 daemon error code | `ok=false` 时返回 |
 
 通知语义：
 
 - 通知表示“某个 skill 的 source workspace 可能已变化”，不是安全结论。
+- `reconcile` 表示“请将 Ledger 侧状态与当前 skill 目录状态对齐”，不是具体文件操作；它应使用 `paths=[]`，且进入同一 notify queue。
+- SkillFS 是受信任事件来源；daemon 对 `skillDir` 做格式、存在性和 `SKILL.md` 检查，不要求该目录预先存在于 `managedSkillDirs`。
+- 对未被当前配置覆盖的新 skill，包括 SkillFS 启动时发来的 `reconcile` skill，daemon 执行 scan 时会沿用 Skill Ledger 现有自动记忆逻辑，将该 skill 目录或父目录 glob 写入 `managedSkillDirs`，供后续 reconcile 使用。
 - 通知成功只表示 daemon 已接收事件，不表示 scan 已完成，也不表示 activation 已刷新。
-- `.skill-meta/**` 路径变化不应触发通知，避免 Ledger 写 metadata 时形成循环。
+- `.skill-meta/**` only 事件会返回 `accepted=true, ignored=true`，不触发扫描，避免 Ledger 写 metadata 时形成循环。SkillFS 也可以选择不发送这类事件。
 - 事件可以重复、乱序或合并；daemon 必须按 skill 维度 debounce，并以当前磁盘状态重新计算。
 
-Skill Ledger daemon 侧应执行的逻辑：
+Skill Ledger daemon 侧执行的逻辑：
 
-- 接收事件并按 skill debounce。
-- 对 source/current workspace 执行 scan 或必要的状态刷新，再调用内部 resolver。
-- 写入新的 `.skill-meta/activation.json`。
-- 启动或重启时 reconcile managed skill dirs，补处理 daemon 下线期间错过的变化。
+- 接收事件并按 `skillDir` debounce，默认 debounce 窗口为 500ms。
+- 对 source/current workspace 执行 `scan`。如果扫描为 `noop`，仍继续刷新 activation。
+- `reconcile` 不走独立扫描链路；它与安装、修改、rename 等事件一样进入同一 debounced worker，执行同一套 scan + activation refresh。
+- 如果 scan 失败，仍尝试刷新 activation，以便 `drifted`、`tampered` 等状态可以回退到历史 pass snapshot。
+- 调用内部 resolver，写入新的 `.skill-meta/activation.json` 与 xattr。
+- 启动或重启时 reconcile `managedSkillDirs`，补处理 daemon 下线期间错过的变化。
 
 `check` 保持只读状态检查，不作为版本或 snapshot 创建入口。
 
@@ -194,8 +224,8 @@ SkillFS 应维护 append-only JSONL 事件日志，供 daemon reconcile、观测
 | `time` | string | RFC 3339 UTC timestamp | SkillFS 记录事件的时间 |
 | `skillDir` | string | 绝对路径 | source/current workspace 中的 skill 根目录 |
 | `skillName` | string | 非空字符串 | skill 名称；应与 `skillDir` basename 一致 |
-| `eventKind` | string | `mkdir` / `create` / `write` / `rename` / `unlink` / `rmdir` / `truncate` / `chmod` / `chown` / `unknown` | SkillFS 观察到的文件系统变化类型 |
-| `paths` | string[] | 相对 `skillDir` 的路径数组，可为空 | 触发变化的相对路径；不得包含 `.skill-meta/**` |
+| `eventKind` | string | `mkdir` / `create` / `write` / `rename` / `unlink` / `rmdir` / `setattr` / `truncate` / `reconcile` | SkillFS 观察到的文件系统变化类型；`reconcile` 表示启动后状态对齐 |
+| `paths` | string[] | 相对 `skillDir` 的路径数组，可为空；不得是绝对路径，不得包含 `..` | 触发变化的相对路径 |
 
 日志要求：
 
@@ -212,11 +242,25 @@ SkillFS 应维护 append-only JSONL 事件日志，供 daemon reconcile、观测
 
 ## 策略
 
-当前默认策略为 `pass_only`：
+activation policy 是 Skill Ledger 配置项，SkillFS 不感知策略，只消费最终
+`activation.json.target` 或同语义 xattr。当前支持全局策略：
 
-- 只激活签名有效、manifest hash 有效、snapshot 完整、`scanStatus=pass` 的版本。
-- 当前 source 处于 `drifted`、`warn`、`deny`、`tampered` 或 `none` 时，不激活 source。
-- 若存在最近 pass snapshot，则 activation 指向该 snapshot。
-- 若不存在可信 pass snapshot，则 activation target 为 `null`。
+```json
+{
+  "activationPolicy": "latest_scanned"
+}
+```
 
-后续如果引入 warn/deny 的可配置策略，策略仍由 Skill Ledger 计算；SkillFS 的消费合同不变。
+允许值：
+
+| policy | 激活规则 |
+|--------|----------|
+| `pass_only` | 只激活签名有效、manifest hash 有效、snapshot 完整、`scanStatus=pass` 的最新 snapshot。 |
+| `pass_warn_only` | 激活签名有效、manifest hash 有效、snapshot 完整、且 `scanStatus in {"pass","warn"}` 的最新 snapshot；`deny` snapshot 会被跳过。 |
+| `latest_scanned` | 激活签名有效、manifest hash 有效、snapshot 完整、且 `scanStatus in {"pass","warn","deny"}` 的最新 snapshot。 |
+
+三种策略都不会激活 source/current 工作区。`latest_scanned` 中的 “latest”
+指最新可校验的 signed snapshot，不是当前未扫描的 source 文件树。`pass_warn_only`
+会暴露 `warn` snapshot，但会跳过 `deny` snapshot 并回退到更早的 `pass` / `warn`
+snapshot；若没有符合策略的版本，则 activation target 为 `null`。`scanStatus=none`
+表示尚无扫描结论，不会被任一策略激活。

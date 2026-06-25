@@ -38,18 +38,28 @@ pub async fn delete_snapshots_locked(
     to_remove: &[String],
     label: &str,
 ) -> CleanupOutcome {
+    // Relink DAG + detach all non-pinned snaps in one write lock (pure memory, no fs I/O).
+    // Holding a single lock eliminates the TOCTOU window where a concurrent
+    // checkpoint/rollback could reference a node we're about to delete.
+    let detached: Vec<(String, SnapshotMeta)> = {
+        let ids: std::collections::HashSet<String> = to_remove.iter().cloned().collect();
+        let mut ws = arc.write().await;
+        ws.index.prune_chain(&ids);
+        to_remove
+            .iter()
+            .filter_map(|snap_id| match ws.index.snapshots.get(snap_id) {
+                Some(m) if !m.pinned => ws
+                    .index
+                    .snapshots
+                    .remove(snap_id)
+                    .map(|m| (snap_id.clone(), m)),
+                _ => None,
+            })
+            .collect()
+    };
     let mut removed = Vec::new();
     let mut failed: Vec<(String, String)> = Vec::new();
-    for snap_id in to_remove {
-        let detached = {
-            let mut ws = arc.write().await;
-            match ws.index.snapshots.get(snap_id) {
-                Some(m) if !m.pinned => ws.index.snapshots.remove(snap_id),
-                _ => None,
-            }
-        };
-        let Some(meta) = detached else { continue };
-
+    for (snap_id, meta) in &detached {
         match state
             .backend
             .cleanup_snapshots(ws_id, std::slice::from_ref(snap_id))
@@ -58,11 +68,15 @@ pub async fn delete_snapshots_locked(
             Ok(deleted) if deleted.is_empty() => {
                 // Backend reported no-op (already gone); roll back the detach
                 // so the index doesn't drift.
+                tracing::warn!(
+                    "{}: re-inserted {} after backend no-op; DAG links may be stale (orphaned node)",
+                    label, snap_id,
+                );
                 arc.write()
                     .await
                     .index
                     .snapshots
-                    .insert(snap_id.clone(), meta);
+                    .insert(snap_id.clone(), meta.clone());
             }
             Ok(_) => {
                 info!("{}: removed snapshot {}", label, snap_id);
@@ -73,8 +87,13 @@ pub async fn delete_snapshots_locked(
                     .await
                     .index
                     .snapshots
-                    .insert(snap_id.clone(), meta);
-                tracing::warn!("{}: backend delete failed for {}: {:#}", label, snap_id, e);
+                    .insert(snap_id.clone(), meta.clone());
+                tracing::warn!(
+                    "{}: backend delete failed for {}: {:#}; re-inserted as orphaned node",
+                    label,
+                    snap_id,
+                    e
+                );
                 failed.push((snap_id.clone(), format!("{:#}", e)));
             }
         }
@@ -201,10 +220,19 @@ pub async fn checkpoint(
         pinned: pin,
         created_at: chrono::Utc::now(),
         missing: false,
+        parent_id: ws.index.head.clone(),
+        child_ids: vec![ws_ckpt_common::LIVE_CHILD.to_string()],
     };
 
-    // 9. Update index
+    // 9. Update index (maintain DAG bidirectional pointers)
+    if let Some(old_head) = ws.index.head.clone() {
+        if let Some(hm) = ws.index.snapshots.get_mut(&old_head) {
+            hm.child_ids.retain(|c| c != ws_ckpt_common::LIVE_CHILD);
+            hm.child_ids.push(snapshot_id.clone());
+        }
+    }
     ws.index.snapshots.insert(snapshot_id.clone(), meta);
+    ws.index.head = Some(snapshot_id.clone());
 
     // 10. Persist index
     index_store::save(&snap_dir, &ws.index).await?;
@@ -225,7 +253,8 @@ pub async fn checkpoint(
 pub async fn rollback(
     state: &Arc<DaemonState>,
     workspace: &str,
-    to: &str,
+    to: Option<&str>,
+    num_ancestors: Option<u32>,
 ) -> anyhow::Result<Response> {
     // 1. Resolve workspace
     let arc = match state.resolve_workspace(workspace).await {
@@ -245,43 +274,123 @@ pub async fn rollback(
     }
 
     // 4. Write lock: validate snapshot + execute rollback
-    let ws = arc.write().await;
+    let mut ws = arc.write().await;
 
-    let resolved_id = match ws.index.resolve_by_prefix(to) {
-        Ok((id, _)) => id.clone(),
-        Err(ResolveError::NotFound) => {
-            return Ok(Response::Error {
-                code: ErrorCode::SnapshotNotFound,
-                message: format!("snapshot not found: {}", to),
-            });
-        }
-        Err(ResolveError::Ambiguous(n)) => {
-            return Ok(Response::Error {
-                code: ErrorCode::SnapshotNotFound,
-                message: format!("ambiguous snapshot prefix '{}': {} matches", to, n),
-            });
-        }
+    let resolved_id = match resolve_rollback_target(&ws.index, to, num_ancestors) {
+        Ok(id) => id,
+        Err(resp) => return Ok(*resp),
     };
 
-    if ws
-        .index
-        .snapshots
-        .get(&resolved_id)
-        .is_some_and(|s| s.missing)
-    {
-        return Ok(Response::Error {
-            code: ErrorCode::SnapshotNotFound,
-            message: format!("Snapshot '{}' subvolume is missing (data lost). Use 'ws-ckpt delete --force -w <workspace> -s {}' to remove the record.", resolved_id, resolved_id),
-        });
+    if let Err(resp) = reject_missing_snapshot(&ws.index, &resolved_id) {
+        return Ok(*resp);
     }
 
     // 5. Rollback via backend (includes warmup, snapshot, cleanup)
     state.backend.rollback(&ws.ws_id, &resolved_id).await?;
 
+    // 6. Update head + migrate LIVE_CHILD
+    if let Some(old_head) = ws.index.head.clone() {
+        if let Some(hm) = ws.index.snapshots.get_mut(&old_head) {
+            hm.child_ids.retain(|c| c != ws_ckpt_common::LIVE_CHILD);
+        }
+    }
+    if let Some(hm) = ws.index.snapshots.get_mut(&resolved_id) {
+        if !hm
+            .child_ids
+            .contains(&ws_ckpt_common::LIVE_CHILD.to_string())
+        {
+            hm.child_ids.push(ws_ckpt_common::LIVE_CHILD.to_string());
+        }
+    }
+    ws.index.head = Some(resolved_id.clone());
+    let snap_dir = state.index_dir(&ws.ws_id);
+    if let Err(e) = crate::index_store::save(&snap_dir, &ws.index).await {
+        tracing::warn!(
+            "rollback index save failed (in-memory state is correct): {:#}",
+            e
+        );
+    }
+
     Ok(Response::RollbackOk {
         from: ws.ws_id.clone(),
         to: resolved_id,
     })
+}
+
+/// Preview the file changes a rollback would apply without replacing the live workspace.
+pub async fn rollback_preview(
+    state: &Arc<DaemonState>,
+    workspace: &str,
+    to: Option<&str>,
+    num_ancestors: Option<u32>,
+) -> anyhow::Result<Response> {
+    let arc = match state.resolve_workspace(workspace).await {
+        Some(a) => a,
+        None => return Ok(workspace_not_found(workspace)),
+    };
+
+    let (ws_id, resolved_id) = {
+        let ws = arc.read().await;
+        let id = match resolve_rollback_target(&ws.index, to, num_ancestors) {
+            Ok(id) => id,
+            Err(resp) => return Ok(*resp),
+        };
+        if let Err(resp) = reject_missing_snapshot(&ws.index, &id) {
+            return Ok(*resp);
+        }
+        (ws.ws_id.clone(), id)
+    };
+
+    let changes = state.backend.diff(&ws_id, &resolved_id, None).await?;
+
+    Ok(Response::RollbackPreviewOk {
+        to: resolved_id,
+        changes,
+    })
+}
+
+fn resolve_rollback_target(
+    index: &ws_ckpt_common::SnapshotIndex,
+    to: Option<&str>,
+    num_ancestors: Option<u32>,
+) -> Result<String, Box<Response>> {
+    if let Some(n) = num_ancestors {
+        return index
+            .ancestor(n as usize)
+            .map(|(id, _)| id.clone())
+            .map_err(|e| {
+                Box::new(Response::Error {
+                    code: ErrorCode::SnapshotNotFound,
+                    message: e.to_string(),
+                })
+            });
+    }
+
+    if let Some(target) = to {
+        return index
+            .resolve_by_prefix(target)
+            .map(|(id, _)| id.clone())
+            .map_err(|err| Box::new(snapshot_resolve_error_response(target, err)));
+    }
+
+    Err(Box::new(Response::Error {
+        code: ErrorCode::SnapshotNotFound,
+        message: "either --snapshot or --num-ancestors must be specified".to_string(),
+    }))
+}
+
+fn reject_missing_snapshot(
+    index: &ws_ckpt_common::SnapshotIndex,
+    snapshot_id: &str,
+) -> Result<(), Box<Response>> {
+    if index.snapshots.get(snapshot_id).is_some_and(|s| s.missing) {
+        return Err(Box::new(Response::Error {
+            code: ErrorCode::SnapshotNotFound,
+            message: format!("Snapshot '{}' subvolume is missing (data lost). Use 'ws-ckpt delete --force -w <workspace> -s {}' to remove the record.", snapshot_id, snapshot_id),
+        }));
+    }
+
+    Ok(())
 }
 
 /// Warm up snapshot metadata cache — forwards to backends::btrfs_common.
@@ -352,7 +461,7 @@ pub async fn diff_snapshots(
     state: &Arc<DaemonState>,
     workspace: &str,
     from: &str,
-    to: &str,
+    to: Option<&str>,
 ) -> anyhow::Result<Response> {
     let arc = match state.resolve_workspace(workspace).await {
         Some(a) => a,
@@ -365,12 +474,21 @@ pub async fn diff_snapshots(
         Ok(id) => id,
         Err(e) => return Ok(snapshot_resolve_error_response(from, e)),
     };
-    let to_id = match resolve_snapshot_id(&ws.index, to) {
-        Ok(id) => id,
-        Err(e) => return Ok(snapshot_resolve_error_response(to, e)),
+    let to_id = match to {
+        Some(t) => {
+            let id = match resolve_snapshot_id(&ws.index, t) {
+                Ok(id) => id,
+                Err(e) => return Ok(snapshot_resolve_error_response(t, e)),
+            };
+            Some(id)
+        }
+        None => None,
     };
 
-    let changes = state.backend.diff(&ws.ws_id, &from_id, &to_id).await?;
+    let changes = state
+        .backend
+        .diff(&ws.ws_id, &from_id, to_id.as_deref())
+        .await?;
 
     Ok(Response::DiffOk { changes })
 }
@@ -510,6 +628,8 @@ mod tests {
             pinned,
             created_at: chrono::Utc::now(),
             missing: false,
+            parent_id: None,
+            child_ids: vec![],
         }
     }
 
@@ -520,6 +640,8 @@ mod tests {
             pinned,
             created_at,
             missing: false,
+            parent_id: None,
+            child_ids: vec![],
         }
     }
 
@@ -676,7 +798,7 @@ mod tests {
             test_backend(),
             test_state_dir(),
         ));
-        let resp = rollback(&state, "/nonexistent/ws/12345", "msg1-step0")
+        let resp = rollback(&state, "/nonexistent/ws/12345", Some("msg1-step0"), None)
             .await
             .unwrap();
         match resp {
@@ -694,7 +816,9 @@ mod tests {
         ));
         let tmpdir = tempfile::tempdir().unwrap();
         let path = tmpdir.path().to_string_lossy().to_string();
-        let resp = rollback(&state, &path, "msg1-step0").await.unwrap();
+        let resp = rollback(&state, &path, Some("msg1-step0"), None)
+            .await
+            .unwrap();
         match resp {
             Response::Error { code, .. } => assert_eq!(code, ErrorCode::WorkspaceNotFound),
             _ => panic!("expected WorkspaceNotFound error"),
@@ -745,6 +869,8 @@ mod tests {
             pinned: true,
             created_at: chrono::Utc::now(),
             missing: false,
+            parent_id: None,
+            child_ids: vec![],
         };
         assert!(pinned.pinned);
 
@@ -754,6 +880,8 @@ mod tests {
             pinned: false,
             created_at: chrono::Utc::now(),
             missing: false,
+            parent_id: None,
+            child_ids: vec![],
         };
         assert!(!unpinned.pinned);
     }
@@ -961,7 +1089,7 @@ mod tests {
             .insert("real-id".to_string(), make_snapshot_meta(false));
         state.register_workspace("ws-diff".to_string(), PathBuf::from("/home/user/ws"), index);
 
-        let resp = diff_snapshots(&state, "ws-diff", "does-not-exist", "real-id")
+        let resp = diff_snapshots(&state, "ws-diff", "does-not-exist", Some("real-id"))
             .await
             .unwrap();
         match resp {
@@ -973,13 +1101,174 @@ mod tests {
         }
 
         // Also covers the `to`-side branch.
-        let resp = diff_snapshots(&state, "ws-diff", "real-id", "missing-to")
+        let resp = diff_snapshots(&state, "ws-diff", "real-id", Some("missing-to"))
             .await
             .unwrap();
         match resp {
             Response::Error { code, message } => {
                 assert_eq!(code, ErrorCode::SnapshotNotFound);
                 assert!(message.contains("missing-to"), "got: {}", message);
+            }
+            other => panic!("expected SnapshotNotFound, got: {:?}", other),
+        }
+    }
+
+    #[tokio::test]
+    async fn diff_and_rollback_preview_reach_live_diff_backend() {
+        use ws_ckpt_common::DiffEntry;
+
+        struct DiffStubBackend;
+
+        #[async_trait::async_trait]
+        impl StorageBackend for DiffStubBackend {
+            fn backend_type(&self) -> ws_ckpt_common::backend::BackendType {
+                ws_ckpt_common::backend::BackendType::BtrfsBase
+            }
+            fn data_root(&self) -> &std::path::Path {
+                std::path::Path::new("/tmp/stub")
+            }
+            fn snapshots_root(&self) -> &std::path::Path {
+                std::path::Path::new("/tmp/stub-snaps")
+            }
+            async fn diff(
+                &self,
+                ws_id: &str,
+                from: &str,
+                to: Option<&str>,
+            ) -> anyhow::Result<Vec<DiffEntry>> {
+                assert_eq!(ws_id, "ws-diff-live");
+                assert_eq!(from, "snap-from");
+                assert!(to.is_none(), "expected to=None, got {:?}", to);
+                Ok(vec![DiffEntry {
+                    path: "live-change.txt".into(),
+                    change_type: ws_ckpt_common::ChangeType::Added,
+                    detail: None,
+                }])
+            }
+            async fn init_workspace(
+                &self,
+                _: &str,
+                _: &str,
+            ) -> anyhow::Result<ws_ckpt_common::WorkspaceInfo> {
+                unimplemented!()
+            }
+            async fn create_snapshot(&self, _: &str, _: &str) -> anyhow::Result<()> {
+                unimplemented!()
+            }
+            async fn rollback(&self, _: &str, _: &str) -> anyhow::Result<PathBuf> {
+                unimplemented!()
+            }
+            async fn delete_snapshot(&self, _: &str, _: &str) -> anyhow::Result<()> {
+                unimplemented!()
+            }
+            async fn recover_workspace(&self, _: &str, _: &str) -> anyhow::Result<()> {
+                unimplemented!()
+            }
+            async fn cleanup_snapshots(
+                &self,
+                _: &str,
+                _: &[String],
+            ) -> anyhow::Result<Vec<String>> {
+                unimplemented!()
+            }
+            async fn fork(&self, _: &str, _: &str, _: &str) -> anyhow::Result<()> {
+                unimplemented!()
+            }
+            async fn gc_generations(
+                &self,
+                _: &str,
+            ) -> anyhow::Result<ws_ckpt_common::backend::GcResult> {
+                unimplemented!()
+            }
+            async fn check_environment(
+                &self,
+            ) -> anyhow::Result<ws_ckpt_common::backend::EnvironmentStatus> {
+                unimplemented!()
+            }
+            async fn get_usage(&self) -> anyhow::Result<(u64, u64)> {
+                unimplemented!()
+            }
+        }
+
+        let state = Arc::new(crate::state::DaemonState::new(
+            test_config(),
+            Arc::new(DiffStubBackend),
+            test_state_dir(),
+        ));
+        let mut index = SnapshotIndex::new(PathBuf::from("/home/user/ws"));
+        index
+            .snapshots
+            .insert("snap-from".to_string(), make_snapshot_meta(false));
+        state.register_workspace(
+            "ws-diff-live".to_string(),
+            PathBuf::from("/home/user/ws"),
+            index,
+        );
+
+        let resp = diff_snapshots(&state, "ws-diff-live", "snap-from", None)
+            .await
+            .unwrap();
+        match resp {
+            Response::DiffOk { changes } => {
+                assert_eq!(changes.len(), 1);
+                assert_eq!(changes[0].path, "live-change.txt");
+            }
+            other => panic!("expected DiffOk, got: {:?}", other),
+        }
+
+        let resp = rollback_preview(&state, "ws-diff-live", Some("snap-from"), None)
+            .await
+            .unwrap();
+        match resp {
+            Response::RollbackPreviewOk { to, changes } => {
+                assert_eq!(to, "snap-from");
+                assert_eq!(changes.len(), 1);
+                assert_eq!(changes[0].path, "live-change.txt");
+            }
+            other => panic!("expected RollbackPreviewOk, got: {:?}", other),
+        }
+    }
+
+    #[tokio::test]
+    async fn rollback_preview_workspace_not_found() {
+        let state = Arc::new(crate::state::DaemonState::new(
+            test_config(),
+            test_backend(),
+            test_state_dir(),
+        ));
+
+        let resp = rollback_preview(&state, "missing-workspace", Some("snap1"), None)
+            .await
+            .unwrap();
+        match resp {
+            Response::Error { code, message } => {
+                assert_eq!(code, ErrorCode::WorkspaceNotFound);
+                assert!(message.contains("missing-workspace"));
+            }
+            other => panic!("expected WorkspaceNotFound, got: {:?}", other),
+        }
+    }
+
+    #[tokio::test]
+    async fn rollback_preview_snapshot_not_found() {
+        let state = Arc::new(crate::state::DaemonState::new(
+            test_config(),
+            test_backend(),
+            test_state_dir(),
+        ));
+        state.register_workspace(
+            "ws-preview".to_string(),
+            PathBuf::from("/home/user/ws"),
+            SnapshotIndex::new(PathBuf::from("/home/user/ws")),
+        );
+
+        let resp = rollback_preview(&state, "ws-preview", Some("missing-snapshot"), None)
+            .await
+            .unwrap();
+        match resp {
+            Response::Error { code, message } => {
+                assert_eq!(code, ErrorCode::SnapshotNotFound);
+                assert!(message.contains("missing-snapshot"));
             }
             other => panic!("expected SnapshotNotFound, got: {:?}", other),
         }
@@ -1061,7 +1350,7 @@ mod tests {
             &self,
             _: &str,
             _: &str,
-            _: &str,
+            _: Option<&str>,
         ) -> anyhow::Result<Vec<ws_ckpt_common::DiffEntry>> {
             unimplemented!()
         }

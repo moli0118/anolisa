@@ -20,6 +20,8 @@
 pub mod audit;
 pub mod cgroup;
 pub mod config;
+pub mod consolidation;
+pub mod embedding;
 pub mod error;
 pub mod git_repo;
 pub mod index;
@@ -27,6 +29,7 @@ pub mod mcp_server;
 pub mod mount;
 pub mod ns;
 pub mod safe_fs;
+pub mod safety;
 pub mod service;
 pub mod session;
 pub mod snapshot;

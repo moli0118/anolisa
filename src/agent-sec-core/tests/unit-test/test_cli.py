@@ -1,11 +1,17 @@
 """Unit tests for the top-level CLI entry points."""
 
 import unittest
+from datetime import datetime, timezone
 from pathlib import Path
 from unittest.mock import patch
 
 import pytest
-from agent_sec_cli.cli import _extract_trace_context_arg, app, main
+from agent_sec_cli.cli import (
+    _extract_trace_context_arg,
+    _resolve_time_range,
+    app,
+    main,
+)
 from agent_sec_cli.correlation_context import (
     TraceContext,
     clear_process_trace_context,
@@ -117,6 +123,34 @@ def test_extract_trace_context_arg_uses_last_top_level_value():
         )
         == '{"session_id":"session-2"}'
     )
+
+
+def test_resolve_time_range_normalizes_explicit_offsets_to_utc() -> None:
+    since, until = _resolve_time_range(
+        None,
+        "2026-05-20T12:00:00+08:00",
+        "2026-05-20T13:00:00+08:00",
+    )
+
+    assert since == "2026-05-20T04:00:00+00:00"
+    assert until == "2026-05-20T05:00:00+00:00"
+
+
+def test_resolve_time_range_last_hours_returns_utc_iso(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr("agent_sec_cli.cli.time.time", lambda: 1_800_000_000.0)
+
+    since, until = _resolve_time_range(1.5, None, None)
+
+    assert (
+        since
+        == datetime.fromtimestamp(
+            1_800_000_000.0 - 5400,
+            tz=timezone.utc,
+        ).isoformat()
+    )
+    assert until == "2027-01-15T08:00:00+00:00"
 
 
 def test_extract_trace_context_arg_stops_at_posix_double_dash():
@@ -631,6 +665,26 @@ class TestScanPiiCli(unittest.TestCase):
 
         self.assertEqual(result.exit_code, 1)
         self.assertIn("--source must be one of", result.output)
+
+    @patch("agent_sec_cli.pii_checker.cli.invoke")
+    def test_scan_pii_accepts_runtime_sources(self, mock_invoke):
+        mock_invoke.return_value = ActionResult(
+            success=True,
+            exit_code=0,
+            stdout='{"ok": true, "verdict": "pass"}',
+            data={"ok": True, "verdict": "pass", "summary": {"total": 0}},
+        )
+
+        for source in ["tool_input", "tool_output", "model_output", "observability"]:
+            with self.subTest(source=source):
+                result = self.runner.invoke(
+                    app,
+                    ["scan-pii", "--text", "hello", "--source", source],
+                )
+
+                self.assertEqual(result.exit_code, 0)
+                _, kwargs = mock_invoke.call_args
+                self.assertEqual(kwargs["source"], source)
 
     @patch("agent_sec_cli.pii_checker.cli.invoke")
     def test_scan_pii_input_default_reads_full_file(self, mock_invoke):

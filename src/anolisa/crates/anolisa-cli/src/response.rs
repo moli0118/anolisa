@@ -86,6 +86,24 @@ pub enum CliError {
     /// surfaced as `Runtime` (exit 1).
     #[error("degraded: {reason}")]
     Degraded { command: String, reason: String },
+
+    /// The command requires elevated privileges that the process lacks.
+    /// Maps to exit code 5 so callers can distinguish permission issues
+    /// from other failures.
+    #[error("permission denied: {reason}")]
+    PermissionDenied {
+        command: String,
+        reason: String,
+        hint: Option<String>,
+    },
+
+    /// Batch command (e.g. `install --all`) finished with one or more
+    /// component failures. The handler has **already** rendered the
+    /// batch summary to stdout (human text or JSON envelope). This
+    /// variant exists solely to propagate a non-zero exit code without
+    /// triggering a second JSON render in [`render_error`].
+    #[error("batch completed with failures")]
+    BatchPartial { command: String },
 }
 
 impl CliError {
@@ -95,6 +113,8 @@ impl CliError {
             Self::InvalidArgument { .. } => "INVALID_ARGUMENT",
             Self::Runtime { .. } => "EXECUTION_FAILED",
             Self::Degraded { .. } => "DEGRADED",
+            Self::PermissionDenied { .. } => "PERMISSION_DENIED",
+            Self::BatchPartial { .. } => "BATCH_PARTIAL",
         }
     }
 
@@ -104,6 +124,8 @@ impl CliError {
             Self::InvalidArgument { .. } => 2,
             Self::Runtime { .. } => 1,
             Self::Degraded { .. } => 2,
+            Self::PermissionDenied { .. } => 5,
+            Self::BatchPartial { .. } => 1,
         }
     }
 
@@ -113,6 +135,8 @@ impl CliError {
             Self::InvalidArgument { command, .. } => command,
             Self::Runtime { command, .. } => command,
             Self::Degraded { command, .. } => command,
+            Self::PermissionDenied { command, .. } => command,
+            Self::BatchPartial { command } => command,
         }
     }
 
@@ -122,6 +146,8 @@ impl CliError {
             Self::InvalidArgument { .. } => None,
             Self::Runtime { .. } => None,
             Self::Degraded { .. } => None,
+            Self::PermissionDenied { hint, .. } => hint.as_deref(),
+            Self::BatchPartial { .. } => None,
         }
     }
 
@@ -133,6 +159,8 @@ impl CliError {
             Self::InvalidArgument { reason, .. } => reason.clone(),
             Self::Runtime { reason, .. } => reason.clone(),
             Self::Degraded { reason, .. } => reason.clone(),
+            Self::PermissionDenied { reason, .. } => reason.clone(),
+            Self::BatchPartial { .. } => "batch completed with failures".to_string(),
         }
     }
 
@@ -149,6 +177,25 @@ impl CliError {
             hint: Some(hint.into()),
         }
     }
+
+    /// Override the command label, preserving the variant and payload.
+    ///
+    /// Used when a helper shared across commands (e.g. install's raw resolver
+    /// reused by `update`) returns an error tagged with the wrong command
+    /// verb; the calling command re-stamps it so the JSON envelope and message
+    /// name the command the user actually ran.
+    pub fn with_command(mut self, command: impl Into<String>) -> Self {
+        let command = command.into();
+        match &mut self {
+            Self::NotImplemented { command: c, .. }
+            | Self::InvalidArgument { command: c, .. }
+            | Self::Runtime { command: c, .. }
+            | Self::Degraded { command: c, .. }
+            | Self::PermissionDenied { command: c, .. }
+            | Self::BatchPartial { command: c } => *c = command,
+        }
+        self
+    }
 }
 
 /// Print a successful JSON envelope to stdout. Callers should only invoke
@@ -160,6 +207,31 @@ impl CliError {
 pub fn render_json<T: Serialize>(command: &str, data: T) -> Result<(), CliError> {
     let response = CliResponse {
         ok: true,
+        schema_version: SCHEMA_VERSION,
+        command: command.to_string(),
+        data: Some(data),
+        warnings: Vec::new(),
+        error: None,
+    };
+    write_json(&response).map_err(|e| CliError::Runtime {
+        command: command.to_string(),
+        reason: format!("failed to serialize JSON response: {e}"),
+    })
+}
+
+/// Print a JSON envelope whose `ok` field reflects `ok`.  Used by batch
+/// commands (e.g. `install --all`) that need to report partial success
+/// without triggering a second error envelope from the top-level
+/// `main` handler.
+///
+/// Callers should only invoke this on the `--json` branch.
+pub fn render_json_with_status<T: Serialize>(
+    command: &str,
+    ok: bool,
+    data: T,
+) -> Result<(), CliError> {
+    let response = CliResponse {
+        ok,
         schema_version: SCHEMA_VERSION,
         command: command.to_string(),
         data: Some(data),
@@ -199,6 +271,12 @@ pub fn render_ok(command: &str) -> Result<(), CliError> {
 /// stderr but still return the original error's exit code so callers
 /// see the failure they expected.
 pub fn render_error(ctx: &CliContext, err: &CliError) -> ExitCode {
+    // BatchPartial means the handler already rendered the complete batch
+    // summary (JSON or human). Skip the error render entirely and just
+    // propagate the non-zero exit code.
+    if let CliError::BatchPartial { .. } = err {
+        return ExitCode::from(err.exit_code());
+    }
     if ctx.json {
         let payload = CliErrorPayload {
             code: err.code().to_string(),

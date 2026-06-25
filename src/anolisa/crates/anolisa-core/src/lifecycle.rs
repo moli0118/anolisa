@@ -67,8 +67,9 @@ use anolisa_env::EnvService;
 use anolisa_platform::fs_layout::FsLayout;
 
 use crate::central_log::{CentralLog, CentralLogError, LogKind, LogRecord, LogStatus, Severity};
-use crate::hooks::{HookPhase, run_phase_hooks};
+use crate::hooks::{HookSpec, run_hooks};
 use crate::lock::{InstallLock, LockError};
+use crate::manifest::ServiceScope;
 use crate::service;
 use crate::state::{
     ExternalModifiedFile, FileOwner as StateFileOwner, InstalledObject, InstalledState, ObjectKind,
@@ -209,6 +210,10 @@ pub struct ServiceAction {
     pub name: String,
     /// Planned behavior for the unit.
     pub action: ServiceActionKind,
+    /// Manager scope, carried from the installed `ServiceRef` so the
+    /// uninstall executor can drive user units via `systemctl --user`.
+    #[serde(default)]
+    pub scope: ServiceScope,
     /// Explanation when a service action is skipped or deferred.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub reason: Option<String>,
@@ -426,12 +431,61 @@ fn plan_services(services: &[ServiceRef]) -> Vec<ServiceAction> {
         .map(|s| ServiceAction {
             name: s.name.clone(),
             action: ServiceActionKind::Stop,
+            scope: s.scope,
             reason: Some(
-                "stops via systemd in system mode; skipped on user/non-linux/container hosts"
+                "stops and disables via systemd; user-scope units via `systemctl --user`; skipped on non-linux/container hosts"
                     .to_string(),
             ),
         })
         .collect()
+}
+
+/// Run `daemon-reload` for one scope after its unit files were removed, record
+/// the audit line, and return a warning string on failure.
+///
+/// Best-effort: a `NotSupported` manager (non-linux / container / wrong mode)
+/// is a quiet skip returning `None`, and a reload error warns without failing
+/// uninstall. `component` labels the audit record.
+fn reload_after_unit_removal(
+    manager: &dyn service::ServiceManager,
+    central: &CentralLog,
+    component: &str,
+    operation_id: &str,
+    actor: &str,
+    install_mode: &str,
+) -> Option<String> {
+    if !manager.supported() {
+        return None;
+    }
+    match manager.daemon_reload() {
+        Ok(_) => {
+            service::record_service_op(
+                Some(central),
+                service::ServiceOp::DaemonReload,
+                component,
+                "",
+                operation_id,
+                actor,
+                install_mode,
+                None,
+            );
+            None
+        }
+        Err(err) => {
+            let msg = format!("daemon-reload after unit removal failed: {err}");
+            service::record_service_op(
+                Some(central),
+                service::ServiceOp::DaemonReload,
+                component,
+                "",
+                operation_id,
+                actor,
+                install_mode,
+                Some(&msg),
+            );
+            Some(msg)
+        }
+    }
 }
 
 /// Configuration fragments to drop on `Purge`. Today we only purge the
@@ -473,9 +527,17 @@ fn default_hooks_for(operation: LifecycleOperation) -> Vec<HookAction> {
     names
         .iter()
         .map(|n| HookAction {
+            // The plan is built from installed state, which does not carry
+            // the component contract, so build() cannot tell here whether a
+            // script is declared for this phase — the executor resolves that
+            // from the installed manifest at run time. Preview it as Execute
+            // with a reason that names the condition.
             name: (*n).to_string(),
-            mode: LifecycleMode::NotImplemented,
-            reason: Some("hook execution not shipped in alpha".to_string()),
+            mode: LifecycleMode::Execute,
+            reason: Some(
+                "runs the contract [[component.hooks]] script for this phase when declared"
+                    .to_string(),
+            ),
         })
         .collect()
 }
@@ -707,10 +769,34 @@ pub enum LifecycleError {
     },
 }
 
+/// Contract-driven lifecycle hooks the caller pre-resolved from the
+/// installed component manifest, grouped by phase.
+///
+/// The executor takes these as input rather than discovering them itself:
+/// the CLI layer owns the installed-manifest path convention and reads back
+/// each component's `[[component.hooks]]` (placeholder expansion + the real
+/// `strict`/`timeout` already applied by
+/// [`resolve_manifest_hooks`](crate::hooks::resolve_manifest_hooks)). A
+/// caller with no manifest snapshot (older installs, RPM-delegated paths)
+/// passes the [`Default`] empty value and the uninstall simply runs no
+/// hooks.
+#[derive(Debug, Default)]
+pub struct ResolvedLifecycleHooks {
+    /// Hooks to run before service-stop and file removal. A `strict = true`
+    /// hook that fails aborts the uninstall and rolls back; `strict = false`
+    /// (e.g. ws-ckpt's recover) only warns.
+    pub pre_uninstall: Vec<HookSpec>,
+    /// Hooks to run after the lock is released and removal has committed.
+    /// Always best-effort — failures only warn.
+    pub post_uninstall: Vec<HookSpec>,
+}
+
 /// Execute a plan (`Uninstall` or `Purge`).
 ///
 /// `actor` is recorded in every audit record; `install_mode` is mirrored
 /// into the central-log records so audit pipelines can filter by mode.
+/// `hooks` carries the component's contract-declared pre/post-uninstall
+/// scripts (see [`ResolvedLifecycleHooks`]).
 ///
 /// The choice of "remove the component object vs. mark it removed":
 /// the alpha state schema has no `Removed` `ObjectStatus`, so the
@@ -722,8 +808,9 @@ pub fn execute_plan(
     layout: &FsLayout,
     actor: &str,
     install_mode: &str,
+    hooks: &ResolvedLifecycleHooks,
 ) -> Result<LifecycleOutcome, LifecycleError> {
-    execute_uninstall_or_purge(plan, layout, actor, install_mode)
+    execute_uninstall_or_purge(plan, layout, actor, install_mode, hooks)
 }
 
 /// `Purge` is still plan-only. The verb declares "remove ANOLISA-owned
@@ -762,6 +849,7 @@ fn execute_uninstall_or_purge(
     layout: &FsLayout,
     actor: &str,
     install_mode: &str,
+    hooks: &ResolvedLifecycleHooks,
 ) -> Result<LifecycleOutcome, LifecycleError> {
     let state_path = layout.state_dir.join("installed.toml");
     let target_name = plan.component.as_str();
@@ -856,17 +944,16 @@ fn execute_uninstall_or_purge(
     // Step 5.25 — pre_uninstall hooks. Run BEFORE service-stop and
     // file-deletion so hooks can drain state, snapshot data, or notify
     // dependents while the component's binaries and services are still
-    // in place.
-    let hook_components: Vec<String> = vec![target_name.to_string()];
-    let pre_uninstall = run_phase_hooks(
+    // in place. Strictness comes from each hook's contract declaration —
+    // a `strict = true` hook failing sets `hard_failure` (→ rollback),
+    // while a `strict = false` hook (e.g. ws-ckpt's recover) only warns.
+    let pre_uninstall = run_hooks(
+        &hooks.pre_uninstall,
         layout,
-        &hook_components,
-        HookPhase::PreUninstall,
         Some(&central),
         &operation_id,
         actor,
         install_mode,
-        true,
     );
 
     if let Some(hf) = pre_uninstall.hard_failure.as_ref() {
@@ -889,71 +976,49 @@ fn execute_uninstall_or_purge(
         );
     }
 
-    // Step 5.5 — best-effort stop of every owned service unit BEFORE
-    // the delete loop. Stopping a service before unlinking its binary
-    // is the only sequence that lets a still-running daemon shut down
-    // cleanly. Stop failures NEVER fail uninstall — they surface on
-    // `LifecycleOutcome.warnings`.
+    // Step 5.5 — best-effort stop AND disable of every owned service unit
+    // BEFORE the delete loop. Stopping before unlinking the binary lets a
+    // running daemon shut down cleanly; disabling removes the boot symlink
+    // install (P0-c) created via `enable`, so an uninstalled component
+    // leaves no orphan `enabled` unit. Both are best-effort: failures NEVER
+    // fail uninstall — they surface on `LifecycleOutcome.warnings`.
     let mut warnings_pre_delete: Vec<String> = pre_uninstall.warnings;
     {
-        let mut units: Vec<(String, String)> = Vec::new();
+        // Partition by scope: system units stop/disable via `systemctl`, user
+        // units via `systemctl --user`. Each scope is driven by its matching
+        // factory so a user-mode uninstall tears down per-user units and a
+        // system-mode uninstall leaves them (place-only, mirroring install).
+        let mut sys_units: Vec<(String, String)> = Vec::new();
+        let mut user_units: Vec<(String, String)> = Vec::new();
         for c in &live_plan.components {
             for s in &c.services {
-                units.push((c.name.clone(), s.name.clone()));
+                match s.scope {
+                    ServiceScope::User => user_units.push((c.name.clone(), s.name.clone())),
+                    ServiceScope::System => sys_units.push((c.name.clone(), s.name.clone())),
+                }
             }
         }
-        if !units.is_empty() {
+        if !sys_units.is_empty() || !user_units.is_empty() {
             let env = EnvService::detect();
-            let manager = service::for_install_mode(install_mode, &env);
-            if manager.supported() {
-                for (component, unit) in &units {
-                    match manager.stop_service(unit) {
-                        Ok(_) => {
-                            service::record_service_op(
-                                Some(&central),
-                                service::ServiceOp::Stop,
-                                component,
-                                unit,
-                                &operation_id,
-                                actor,
-                                install_mode,
-                                None,
-                            );
-                        }
-                        Err(err) => {
-                            let err_msg = err.to_string();
-                            warnings_pre_delete.push(format!(
-                                "service stop skipped for {component}/{unit}: {err_msg}",
-                            ));
-                            service::record_service_op(
-                                Some(&central),
-                                service::ServiceOp::Stop,
-                                component,
-                                unit,
-                                &operation_id,
-                                actor,
-                                install_mode,
-                                Some(&err_msg),
-                            );
-                        }
-                    }
+            for (units, manager) in [
+                (sys_units, service::for_install_mode(install_mode, &env)),
+                (
+                    user_units,
+                    service::user_service_for_install_mode(install_mode, &env),
+                ),
+            ] {
+                if units.is_empty() {
+                    continue;
                 }
-            } else {
-                let manager_name = manager.manager().to_string();
-                let reason = manager.unsupported_reason().map(str::to_string);
-                for (component, unit) in &units {
-                    service::record_service_op_unsupported(
-                        Some(&central),
-                        service::ServiceOp::Stop,
-                        component,
-                        unit,
-                        &operation_id,
-                        actor,
-                        install_mode,
-                        &manager_name,
-                        reason.as_deref(),
-                    );
-                }
+                let deactivation = service::deactivate_services(
+                    manager.as_ref(),
+                    &units,
+                    Some(&central),
+                    &operation_id,
+                    actor,
+                    install_mode,
+                );
+                warnings_pre_delete.extend(deactivation.warnings);
             }
         }
     }
@@ -1388,6 +1453,52 @@ fn execute_uninstall_or_purge(
         ));
         combined.push(msg);
     }
+
+    // Step 8.5 — daemon-reload AFTER the owned unit files are gone, so the
+    // manager drops the now-deleted units from its database (the
+    // uninstall-side mirror of the install reload — without it systemd keeps
+    // a stale unit until the next manual reload). Best-effort: a failed
+    // reload only warns. Reload each scope that had units removed through its
+    // own manager, so a user-scope teardown issues `systemctl --user
+    // daemon-reload` and a system-scope one issues the plain reload.
+    {
+        let has_sys = live_plan
+            .components
+            .iter()
+            .any(|c| c.services.iter().any(|s| s.scope == ServiceScope::System));
+        let has_user = live_plan
+            .components
+            .iter()
+            .any(|c| c.services.iter().any(|s| s.scope == ServiceScope::User));
+        if has_sys || has_user {
+            let env = EnvService::detect();
+            if has_sys {
+                if let Some(msg) = reload_after_unit_removal(
+                    service::for_install_mode(install_mode, &env).as_ref(),
+                    &central,
+                    target_name,
+                    &operation_id,
+                    actor,
+                    install_mode,
+                ) {
+                    combined.push(msg);
+                }
+            }
+            if has_user {
+                if let Some(msg) = reload_after_unit_removal(
+                    service::user_service_for_install_mode(install_mode, &env).as_ref(),
+                    &central,
+                    target_name,
+                    &operation_id,
+                    actor,
+                    install_mode,
+                ) {
+                    combined.push(msg);
+                }
+            }
+        }
+    }
+
     let warnings = combined;
 
     // Best-effort cleanup of backups on the success path.
@@ -1398,18 +1509,27 @@ fn execute_uninstall_or_purge(
     // Step 11 — post_uninstall hooks. Run AFTER the lock has been
     // released so cleanup scripts can do their own slow IO (rsync state
     // out, archive logs, notify external systems) without holding up
-    // concurrent CLI calls. Failures only warn — by now the central
-    // log already records `succeeded` and `installed.toml` reflects
-    // removal; downgrading would lie about what is on disk.
-    let post_uninstall = run_phase_hooks(
+    // concurrent CLI calls. post_* hooks are best-effort by design: clear
+    // any contract `strict` flag so a failing cleanup script only warns and
+    // never short-circuits the remaining ones — by now the central log
+    // already records `succeeded` and `installed.toml` reflects removal, so
+    // gating here would lie about what is on disk.
+    let post_specs: Vec<HookSpec> = hooks
+        .post_uninstall
+        .iter()
+        .cloned()
+        .map(|mut s| {
+            s.strict = false;
+            s
+        })
+        .collect();
+    let post_uninstall = run_hooks(
+        &post_specs,
         layout,
-        &hook_components,
-        HookPhase::PostUninstall,
         Some(&central),
         &operation_id,
         actor,
         install_mode,
-        false,
     );
     let mut warnings = warnings;
     warnings.extend(post_uninstall.warnings);
@@ -1463,7 +1583,7 @@ fn finalize_journal_with_warnings(
 
 /// What [`prepare_backup`] wrote at the backup path.
 #[derive(Debug)]
-enum BackupArtifact {
+pub enum BackupArtifact {
     /// Regular file copied byte-for-byte; sha256 of those bytes.
     File {
         /// Content hash recorded on the `RestoreFile` rollback action.
@@ -1476,7 +1596,7 @@ enum BackupArtifact {
 
 impl BackupArtifact {
     /// Hash to record on the rollback action; `None` for symlinks.
-    fn into_sha256(self) -> Option<String> {
+    pub fn into_sha256(self) -> Option<String> {
         match self {
             Self::File { sha256 } => Some(sha256),
             Self::Symlink => None,
@@ -1505,7 +1625,7 @@ impl BackupArtifact {
 ///
 /// Returns `Ok(None)` only if `src` is `NotFound`; other errors are
 /// surfaced as [`LifecycleError::Filesystem`].
-fn prepare_backup(src: &Path, backup: &Path) -> Result<Option<BackupArtifact>, LifecycleError> {
+pub fn prepare_backup(src: &Path, backup: &Path) -> Result<Option<BackupArtifact>, LifecycleError> {
     use std::io::{Read, Write};
 
     match fs::symlink_metadata(src) {
@@ -1875,7 +1995,10 @@ mod tests {
             status: ObjectStatus::Installed,
             manifest_digest: None,
             distribution_source: Some("file:///fake".to_string()),
+            raw_package: None,
             install_backend: Some("raw".to_string()),
+            ownership: None,
+            rpm_metadata: None,
             installed_at: "2026-06-01T10:00:00Z".to_string(),
             last_operation_id: Some("op-prior".to_string()),
             managed: true,
@@ -1900,6 +2023,7 @@ mod tests {
                 manager: "systemd".to_string(),
                 restartable: true,
                 enabled: false,
+                scope: ServiceScope::System,
             }],
             health: Vec::new(),
         });
@@ -1919,7 +2043,12 @@ mod tests {
     }
 
     #[cfg(unix)]
-    fn write_hook_script(layout: &FsLayout, component: &str, phase: &str, body: &str) {
+    fn write_hook_script(
+        layout: &FsLayout,
+        component: &str,
+        phase: &str,
+        body: &str,
+    ) -> std::path::PathBuf {
         use std::os::unix::fs::PermissionsExt;
         let dir = layout.datadir.join("hooks").join(component);
         std_fs::create_dir_all(&dir).expect("mkdir hook dir");
@@ -1928,17 +2057,18 @@ mod tests {
         let mut perm = std_fs::metadata(&path).expect("stat hook").permissions();
         perm.set_mode(0o755);
         std_fs::set_permissions(&path, perm).expect("chmod hook");
+        path
     }
 
-    /// pre_uninstall + post_uninstall scripts discovered under
-    /// `<datadir>/hooks/<component>/<phase>.sh` must actually run
-    /// during a real uninstall AND emit a `LogKind::Component` record
-    /// per attempt to the central log. This pins the wiring so a
-    /// future refactor of `execute_uninstall_or_purge` cannot drop
-    /// hook execution silently.
+    /// Contract-declared pre_uninstall + post_uninstall scripts, passed in
+    /// via [`ResolvedLifecycleHooks`], must actually run during a real
+    /// uninstall AND emit a `LogKind::Component` record per attempt. This
+    /// pins the wiring so a future refactor of `execute_uninstall_or_purge`
+    /// cannot drop hook execution silently.
     #[test]
     #[cfg(unix)]
     fn uninstall_runs_pre_and_post_hooks_and_records_them_in_central_log() {
+        use crate::hooks::HookPhase;
         let root = tempdir().expect("tempdir");
         let layout = fixture_layout(root.path());
         std_fs::create_dir_all(&layout.bin_dir).unwrap();
@@ -1950,24 +2080,29 @@ mod tests {
 
         seed_state_with_two_files(&layout, "agentsight", &owned_path, &external_path);
 
-        write_hook_script(
+        let pre = write_hook_script(
             &layout,
             "agentsight",
             "pre_uninstall",
             "#!/bin/sh\nexit 0\n",
         );
-        write_hook_script(
+        let post = write_hook_script(
             &layout,
             "agentsight",
             "post_uninstall",
             "#!/bin/sh\nexit 0\n",
         );
+        let hooks = ResolvedLifecycleHooks {
+            pre_uninstall: vec![HookSpec::new("agentsight", HookPhase::PreUninstall, pre)],
+            post_uninstall: vec![HookSpec::new("agentsight", HookPhase::PostUninstall, post)],
+        };
 
         let plan = LifecyclePlan::for_component_uninstall(
             "agentsight",
             &InstalledState::load(&layout.state_dir.join("installed.toml")).unwrap(),
         );
-        let outcome = execute_plan(&plan, &layout, "tester", "system").expect("uninstall ok");
+        let outcome =
+            execute_plan(&plan, &layout, "tester", "system", &hooks).expect("uninstall ok");
 
         let lines = read_log_lines(&layout.central_log);
         // Filter on `command starts with "hook:"` so service-op
@@ -2007,6 +2142,272 @@ mod tests {
                 Some("agentsight"),
             );
         }
+    }
+
+    /// The uninstall-side daemon-reload is gated on the component actually
+    /// declaring service units: a component with none must never emit a
+    /// `service:daemon-reload` record — the manager is not even built, so
+    /// the gate also keeps the no-service uninstall free of systemctl.
+    #[test]
+    #[cfg(unix)]
+    fn uninstall_without_services_does_not_daemon_reload() {
+        let root = tempdir().expect("tempdir");
+        let layout = fixture_layout(root.path());
+        std_fs::create_dir_all(&layout.bin_dir).unwrap();
+        let owned_path = layout.bin_dir.join("os-skills-marker");
+        std_fs::write(&owned_path, b"owned").unwrap();
+
+        std_fs::create_dir_all(&layout.state_dir).expect("mkdir state");
+        let mut state = InstalledState::default();
+        state.upsert_object(InstalledObject {
+            kind: ObjectKind::Component,
+            name: "os-skills".to_string(),
+            version: "0.2.0".to_string(),
+            status: ObjectStatus::Installed,
+            manifest_digest: None,
+            distribution_source: Some("file:///fake".to_string()),
+            raw_package: None,
+            install_backend: Some("raw".to_string()),
+            ownership: None,
+            rpm_metadata: None,
+            installed_at: "2026-06-01T10:00:00Z".to_string(),
+            last_operation_id: Some("op-prior".to_string()),
+            managed: true,
+            adopted: false,
+            subscription_scope: Default::default(),
+            enabled_features: Vec::new(),
+            component_refs: Vec::new(),
+            files: vec![OwnedFile {
+                path: owned_path.clone(),
+                owner: StateFileOwner::Anolisa,
+                sha256: Some("0".repeat(64)),
+            }],
+            external_modified_files: Vec::new(),
+            services: Vec::new(),
+            health: Vec::new(),
+        });
+        state
+            .save(&layout.state_dir.join("installed.toml"))
+            .expect("seed state save");
+
+        let hooks = ResolvedLifecycleHooks {
+            pre_uninstall: Vec::new(),
+            post_uninstall: Vec::new(),
+        };
+        let plan = LifecyclePlan::for_component_uninstall(
+            "os-skills",
+            &InstalledState::load(&layout.state_dir.join("installed.toml")).unwrap(),
+        );
+        execute_plan(&plan, &layout, "tester", "system", &hooks).expect("uninstall ok");
+
+        let lines = read_log_lines(&layout.central_log);
+        assert!(
+            !lines.iter().any(|l| {
+                l.get("command").and_then(|v| v.as_str()) == Some("service:daemon-reload")
+            }),
+            "no service units declared — must not daemon-reload: {lines:?}",
+        );
+        assert!(!owned_path.exists(), "owned file should be removed");
+    }
+
+    #[test]
+    fn plan_services_carries_scope_from_service_ref() {
+        let refs = vec![
+            ServiceRef {
+                name: "agentsight.service".to_string(),
+                manager: "systemd".to_string(),
+                restartable: true,
+                enabled: true,
+                scope: ServiceScope::System,
+            },
+            ServiceRef {
+                name: "anolisa-memory@alice.service".to_string(),
+                manager: "systemd-user".to_string(),
+                restartable: false,
+                enabled: false,
+                scope: ServiceScope::User,
+            },
+        ];
+        let actions = plan_services(&refs);
+        assert!(matches!(actions[0].scope, ServiceScope::System));
+        assert!(matches!(actions[1].scope, ServiceScope::User));
+    }
+
+    /// A `scope = user` unit removed under a **system-mode** uninstall is
+    /// place-only: the user manager is `NotSupported` (mirroring install,
+    /// where a system-mode install only places per-user templates), so
+    /// teardown is a recorded skip with no `systemctl --user daemon-reload`,
+    /// while the owned files are still removed.
+    #[test]
+    #[cfg(unix)]
+    fn uninstall_user_scope_service_in_system_mode_is_place_only() {
+        let root = tempdir().expect("tempdir");
+        let layout = fixture_layout(root.path());
+        std_fs::create_dir_all(&layout.bin_dir).unwrap();
+        let owned_path = layout.bin_dir.join("anolisa-memory");
+        std_fs::write(&owned_path, b"owned").unwrap();
+
+        std_fs::create_dir_all(&layout.state_dir).expect("mkdir state");
+        let mut state = InstalledState::default();
+        state.upsert_object(InstalledObject {
+            kind: ObjectKind::Component,
+            name: "agent-memory".to_string(),
+            version: "0.1.0".to_string(),
+            status: ObjectStatus::Installed,
+            manifest_digest: None,
+            distribution_source: Some("file:///fake".to_string()),
+            raw_package: None,
+            install_backend: Some("raw".to_string()),
+            ownership: None,
+            rpm_metadata: None,
+            installed_at: "2026-06-01T10:00:00Z".to_string(),
+            last_operation_id: Some("op-prior".to_string()),
+            managed: true,
+            adopted: false,
+            subscription_scope: Default::default(),
+            enabled_features: Vec::new(),
+            component_refs: Vec::new(),
+            files: vec![OwnedFile {
+                path: owned_path.clone(),
+                owner: StateFileOwner::Anolisa,
+                sha256: Some("0".repeat(64)),
+            }],
+            external_modified_files: Vec::new(),
+            services: vec![ServiceRef {
+                name: "anolisa-memory@%u.service".to_string(),
+                manager: "systemd-user".to_string(),
+                restartable: false,
+                enabled: false,
+                scope: ServiceScope::User,
+            }],
+            health: Vec::new(),
+        });
+        state
+            .save(&layout.state_dir.join("installed.toml"))
+            .expect("seed state save");
+
+        let hooks = ResolvedLifecycleHooks {
+            pre_uninstall: Vec::new(),
+            post_uninstall: Vec::new(),
+        };
+        let plan = LifecyclePlan::for_component_uninstall(
+            "agent-memory",
+            &InstalledState::load(&layout.state_dir.join("installed.toml")).unwrap(),
+        );
+        execute_plan(&plan, &layout, "tester", "system", &hooks).expect("uninstall ok");
+
+        let lines = read_log_lines(&layout.central_log);
+        assert!(
+            !lines.iter().any(|l| {
+                l.get("command").and_then(|v| v.as_str()) == Some("service:daemon-reload")
+            }),
+            "user-scope teardown in system mode must not daemon-reload: {lines:?}",
+        );
+        let stop = lines
+            .iter()
+            .find(|l| l.get("command").and_then(|v| v.as_str()) == Some("service:stop"))
+            .expect("user unit stop must be recorded");
+        let msg = stop.get("message").and_then(|v| v.as_str()).unwrap_or("");
+        assert!(
+            msg.contains("anolisa-memory@%u.service"),
+            "stop record must target the user unit: {msg}",
+        );
+        assert!(
+            msg.contains("skipped"),
+            "system-mode user teardown is a recorded skip, not a drive: {msg}",
+        );
+        assert!(
+            !owned_path.exists(),
+            "owned unit file should still be removed"
+        );
+    }
+
+    /// ws-ckpt semantics: a **non-strict** pre_uninstall hook that fails
+    /// (e.g. a `recover || warn` that could not recover) must NOT roll back
+    /// the uninstall — it only warns, and removal proceeds.
+    #[test]
+    #[cfg(unix)]
+    fn uninstall_nonstrict_pre_hook_failure_warns_but_completes() {
+        use crate::hooks::HookPhase;
+        let root = tempdir().expect("tempdir");
+        let layout = fixture_layout(root.path());
+        std_fs::create_dir_all(&layout.bin_dir).unwrap();
+        let owned = layout.bin_dir.join("ws-ckpt");
+        std_fs::write(&owned, b"binary").unwrap();
+        let external = layout.etc_dir.join("foreign.conf");
+        std_fs::create_dir_all(external.parent().unwrap()).unwrap();
+        std_fs::write(&external, b"external").unwrap();
+        let state = seed_state_with_two_files(&layout, "ws-ckpt", &owned, &external);
+
+        let script = write_hook_script(&layout, "ws-ckpt", "pre_uninstall", "#!/bin/sh\nexit 1\n");
+        let mut spec = HookSpec::new("ws-ckpt", HookPhase::PreUninstall, script);
+        spec.strict = false;
+        let hooks = ResolvedLifecycleHooks {
+            pre_uninstall: vec![spec],
+            post_uninstall: vec![],
+        };
+
+        let plan = LifecyclePlan::for_component_uninstall("ws-ckpt", &state);
+        let outcome = execute_plan(&plan, &layout, "tester", "system", &hooks)
+            .expect("non-strict hook failure must not abort uninstall");
+
+        assert!(outcome.state_object_removed);
+        assert!(!owned.exists(), "owned file removed despite hook warning");
+        assert!(
+            outcome.warnings.iter().any(|w| w.contains("pre_uninstall")),
+            "hook failure must surface as a warning: {:?}",
+            outcome.warnings,
+        );
+    }
+
+    /// A **strict** pre_uninstall hook that fails aborts the verb and rolls
+    /// back: the owned file is left in place and the error names the phase.
+    #[test]
+    #[cfg(unix)]
+    fn uninstall_strict_pre_hook_failure_aborts_and_rolls_back() {
+        use crate::hooks::HookPhase;
+        let root = tempdir().expect("tempdir");
+        let layout = fixture_layout(root.path());
+        std_fs::create_dir_all(&layout.bin_dir).unwrap();
+        let owned = layout.bin_dir.join("agentsight");
+        std_fs::write(&owned, b"binary").unwrap();
+        let external = layout.etc_dir.join("foreign.conf");
+        std_fs::create_dir_all(external.parent().unwrap()).unwrap();
+        std_fs::write(&external, b"external").unwrap();
+        let state = seed_state_with_two_files(&layout, "agentsight", &owned, &external);
+
+        let script = write_hook_script(
+            &layout,
+            "agentsight",
+            "pre_uninstall",
+            "#!/bin/sh\nexit 7\n",
+        );
+        let mut spec = HookSpec::new("agentsight", HookPhase::PreUninstall, script);
+        spec.strict = true;
+        let hooks = ResolvedLifecycleHooks {
+            pre_uninstall: vec![spec],
+            post_uninstall: vec![],
+        };
+
+        let plan = LifecyclePlan::for_component_uninstall("agentsight", &state);
+        let err = execute_plan(&plan, &layout, "tester", "system", &hooks)
+            .expect_err("strict hook failure must abort");
+        match err {
+            LifecycleError::HookFailed { phase, .. } => assert_eq!(phase, "pre_uninstall"),
+            other => panic!("expected HookFailed, got {other:?}"),
+        }
+        assert!(
+            owned.exists(),
+            "rollback must leave the owned file in place"
+        );
+        let after =
+            InstalledState::load(&layout.state_dir.join("installed.toml")).expect("reload state");
+        assert!(
+            after
+                .find_object(ObjectKind::Component, "agentsight")
+                .is_some(),
+            "component object must survive a rolled-back uninstall",
+        );
     }
 
     #[test]
@@ -2064,8 +2465,14 @@ mod tests {
         let state = seed_state_with_two_files(&layout, "agentsight", &owned, &external);
         let plan = LifecyclePlan::for_component_uninstall("agentsight", &state);
 
-        let outcome =
-            execute_plan(&plan, &layout, "tester", "system").expect("uninstall must succeed");
+        let outcome = execute_plan(
+            &plan,
+            &layout,
+            "tester",
+            "system",
+            &ResolvedLifecycleHooks::default(),
+        )
+        .expect("uninstall must succeed");
         assert_eq!(outcome.operation, LifecycleOperation::Uninstall);
         assert!(outcome.state_object_removed);
         assert_eq!(outcome.removed_files, vec![owned.clone()]);
@@ -2130,8 +2537,14 @@ mod tests {
         // Hold the install lock from this test thread before invoking.
         let _held = crate::lock::InstallLock::acquire(&layout.lock_file)
             .expect("first acquire must succeed");
-        let err = execute_plan(&plan, &layout, "tester", "system")
-            .expect_err("must fail while lock is held");
+        let err = execute_plan(
+            &plan,
+            &layout,
+            "tester",
+            "system",
+            &ResolvedLifecycleHooks::default(),
+        )
+        .expect_err("must fail while lock is held");
         match err {
             LifecycleError::LockHeld { path } => assert_eq!(path, layout.lock_file),
             other => panic!("expected LockHeld, got {other:?}"),
@@ -2200,7 +2613,13 @@ mod tests {
         readonly.set_mode(0o500);
         std_fs::set_permissions(&layout.state_dir, readonly).unwrap();
 
-        let result = execute_plan(&plan, &layout, "tester", "system");
+        let result = execute_plan(
+            &plan,
+            &layout,
+            "tester",
+            "system",
+            &ResolvedLifecycleHooks::default(),
+        );
 
         // Restore writable perms so we can inspect on-disk state.
         std_fs::set_permissions(&layout.state_dir, original).unwrap();
@@ -2274,7 +2693,14 @@ mod tests {
         // No state on disk at all.
         let empty = InstalledState::default();
         let plan = LifecyclePlan::for_component_uninstall("agentsight", &empty);
-        let err = execute_plan(&plan, &layout, "tester", "system").expect_err("must error");
+        let err = execute_plan(
+            &plan,
+            &layout,
+            "tester",
+            "system",
+            &ResolvedLifecycleHooks::default(),
+        )
+        .expect_err("must error");
         match err {
             LifecycleError::ComponentNotInstalled { component } => {
                 assert_eq!(component, "agentsight");
@@ -2305,8 +2731,14 @@ mod tests {
         assert_eq!(plan.operation, LifecycleOperation::Purge);
         assert_eq!(plan.risk, RiskLevel::High);
 
-        let err = execute_plan(&plan, &layout, "tester", "system")
-            .expect_err("purge execute must be gated");
+        let err = execute_plan(
+            &plan,
+            &layout,
+            "tester",
+            "system",
+            &ResolvedLifecycleHooks::default(),
+        )
+        .expect_err("purge execute must be gated");
         match &err {
             LifecycleError::ExecuteGated { reason } => {
                 assert!(
@@ -2341,8 +2773,14 @@ mod tests {
         let state = seed_state_with_two_files(&layout, "agentsight", &owned, &external);
 
         let plan = LifecyclePlan::for_component_uninstall("agentsight", &state);
-        let err = execute_plan(&plan, &layout, "tester", "system")
-            .expect_err("EISDIR must surface as a Filesystem error");
+        let err = execute_plan(
+            &plan,
+            &layout,
+            "tester",
+            "system",
+            &ResolvedLifecycleHooks::default(),
+        )
+        .expect_err("EISDIR must surface as a Filesystem error");
         assert!(
             matches!(err, LifecycleError::Filesystem { .. }),
             "expected Filesystem error, got {err:?}",
@@ -2395,7 +2833,10 @@ mod tests {
             status: ObjectStatus::Installed,
             manifest_digest: None,
             distribution_source: Some("file:///fake".to_string()),
+            raw_package: None,
             install_backend: Some("raw".to_string()),
+            ownership: None,
+            rpm_metadata: None,
             installed_at: "2026-06-01T10:00:00Z".to_string(),
             last_operation_id: Some("op-prior".to_string()),
             managed: true,
@@ -2422,8 +2863,14 @@ mod tests {
             "test premise broken: plan unexpectedly contains a Remove action",
         );
 
-        let outcome =
-            execute_plan(&plan, &layout, "tester", "system").expect("must succeed cleanly");
+        let outcome = execute_plan(
+            &plan,
+            &layout,
+            "tester",
+            "system",
+            &ResolvedLifecycleHooks::default(),
+        )
+        .expect("must succeed cleanly");
         assert!(outcome.removed_files.is_empty());
         assert!(outcome.state_object_removed);
 
@@ -2457,7 +2904,10 @@ mod tests {
             status: ObjectStatus::Installed,
             manifest_digest: None,
             distribution_source: Some("file:///fake".to_string()),
+            raw_package: None,
             install_backend: Some("raw".to_string()),
+            ownership: None,
+            rpm_metadata: None,
             installed_at: "2026-06-01T10:00:00Z".to_string(),
             last_operation_id: Some("op-prior".to_string()),
             managed: true,
@@ -2477,7 +2927,10 @@ mod tests {
             status: ObjectStatus::Installed,
             manifest_digest: None,
             distribution_source: None,
+            raw_package: None,
             install_backend: None,
+            ownership: None,
+            rpm_metadata: None,
             installed_at: "2026-06-01T10:00:00Z".to_string(),
             last_operation_id: None,
             managed: true,
@@ -2494,8 +2947,14 @@ mod tests {
         state.save(&state_path).expect("seed state save");
 
         let plan = LifecyclePlan::for_component_uninstall("agentsight", &state);
-        let outcome =
-            execute_plan(&plan, &layout, "tester", "system").expect("must succeed cleanly");
+        let outcome = execute_plan(
+            &plan,
+            &layout,
+            "tester",
+            "system",
+            &ResolvedLifecycleHooks::default(),
+        )
+        .expect("must succeed cleanly");
 
         assert!(
             outcome
@@ -2551,7 +3010,10 @@ mod tests {
             status: ObjectStatus::Installed,
             manifest_digest: None,
             distribution_source: Some("file:///fake".to_string()),
+            raw_package: None,
             install_backend: Some("raw".to_string()),
+            ownership: None,
+            rpm_metadata: None,
             installed_at: "2026-06-01T10:00:00Z".to_string(),
             last_operation_id: Some("op-prior".to_string()),
             managed: true,
@@ -2572,8 +3034,14 @@ mod tests {
         state.save(&state_path).expect("seed state save");
 
         let plan = LifecyclePlan::for_component_uninstall("agentsight", &state);
-        let outcome =
-            execute_plan(&plan, &layout, "tester", "system").expect("uninstall must succeed");
+        let outcome = execute_plan(
+            &plan,
+            &layout,
+            "tester",
+            "system",
+            &ResolvedLifecycleHooks::default(),
+        )
+        .expect("uninstall must succeed");
 
         assert!(
             victim.exists(),

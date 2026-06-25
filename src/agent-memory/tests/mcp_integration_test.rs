@@ -31,6 +31,14 @@ const EXPECTED_TOOLS: &[&str] = &[
     "mem_snapshot_restore",
     "mem_log",
     "mem_revert",
+    "mem_consolidate",
+    "mem_compact",
+    "memory_task_save",
+    "memory_task_resume",
+    "memory_task_list",
+    "memory_task_close",
+    "mem_export",
+    "mem_import",
 ];
 
 async fn spawn_with_dir(
@@ -693,6 +701,38 @@ async fn tier_c_git_log_and_revert_via_mcp() {
     assert!(
         body.contains("v3"),
         "revert should restore HEAD content: {body}"
+    );
+
+    drop(stdin);
+    let _ = child.kill().await;
+}
+
+#[tokio::test]
+async fn mem_export_returns_ama_json() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (mut child, mut reader, mut stdin) = spawn_with_dir(tmp.path()).await;
+    handshake(&mut reader, &mut stdin).await;
+
+    // Write a memory first
+    call_tool(
+        &mut reader,
+        &mut stdin,
+        100,
+        "mem_write",
+        json!({"path": "export-test.md", "content": "export test content"}),
+    )
+    .await;
+
+    // Export
+    let resp = call_tool(&mut reader, &mut stdin, 200, "mem_export", json!({})).await;
+    let text = extract_text(&resp);
+    assert!(
+        text.contains("anolisa-memory-archive"),
+        "export should return AMA JSON: {text}"
+    );
+    assert!(
+        text.contains("export-test.md"),
+        "export should include written file: {text}"
     );
 
     drop(stdin);

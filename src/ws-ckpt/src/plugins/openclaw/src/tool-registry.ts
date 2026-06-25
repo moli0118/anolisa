@@ -35,6 +35,11 @@ export function registerTools(api: OpenClawPluginApi): void {
         "workspace (default workspace absolute path; used by every command without -w. " +
         "If the path is a symlink, use the link itself — do NOT replace it with the " +
         "resolved real path; the daemon registers and matches by the exact string you pass), " +
+        "cronSchedules (scheduled cron snapshots using standard 5-field cron expressions; " +
+        "value format: 'add \"CRON_EXPR\"', 'remove \"CRON_EXPR\"', or 'set [\"CRON_EXPR\"]'; " +
+        "operates on the current workspace; " +
+        "if the user's scheduling intent cannot be exactly expressed as a cron expression, " +
+        "do NOT write an approximate/degraded schedule — present the closest option and await confirmation), " +
         "maxSnapshotsNum (number of snapshots to keep when auto-cleanup is by count), " +
         "maxSnapshotsDuration (duration to keep when auto-cleanup is by time, e.g. \"7d\"/\"24h\"). " +
         "Only update the specific key requested by the user.",
@@ -48,7 +53,7 @@ export function registerTools(api: OpenClawPluginApi): void {
           key: {
             type: "string",
             description:
-              "Config key to update: autoCheckpoint, workspace, maxSnapshotsNum, maxSnapshotsDuration",
+              "Config key to update: autoCheckpoint, workspace, cronSchedules, maxSnapshotsNum, maxSnapshotsDuration",
           },
           value: {
             type: "string",
@@ -56,6 +61,7 @@ export function registerTools(api: OpenClawPluginApi): void {
               "New value as a string. Formats: " +
               "autoCheckpoint = \"true\"/\"false\"; " +
               "workspace = absolute path; " +
+              "cronSchedules = 'add \"CRON_EXPR\"' / 'remove \"CRON_EXPR\"' / 'set [\"CRON_EXPR\"]'; " +
               "maxSnapshotsNum = positive integer (or \"unset\" to restore inherit-global); " +
               "maxSnapshotsDuration = e.g. \"7d\"/\"24h\" (or \"unset\" to restore inherit-global).",
           },
@@ -112,15 +118,24 @@ export function registerTools(api: OpenClawPluginApi): void {
     {
       name: "ws-ckpt-rollback",
       description:
-        "Roll back the workspace to a previous snapshot. Always call " +
-        "ws-ckpt-list first to confirm the target snapshot id exists; " +
-        "never roll back to an id you haven't verified.",
+        "Preview or roll back the workspace to a previous snapshot or N ancestors back. " +
+        "Set preview=true to inspect file changes without modifying the workspace. " +
+        "Always call ws-ckpt-list first to confirm the target snapshot id " +
+        "exists; never roll back to an id you haven't verified.",
       parameters: {
         type: "object",
         properties: {
           target: {
             type: "string",
-            description: "Snapshot id to roll back to.",
+            description:
+              "Snapshot id to roll back to (mutually exclusive with numAncestors).",
+          },
+          numAncestors: {
+            type: "integer",
+            description:
+              "Number of steps to go back " +
+              "(>=1, mutually exclusive with target). " +
+              "1 = undo last turn, 2 = undo last two turns.",
           },
           workspace: {
             type: "string",
@@ -129,13 +144,19 @@ export function registerTools(api: OpenClawPluginApi): void {
               "configured workspace. If the path is a symlink, use the " +
               "link itself — do NOT replace it with the resolved real path.",
           },
+          preview: {
+            type: "boolean",
+            description:
+              "Optional: preview the file changes without modifying the workspace.",
+          },
         },
-        required: ["target"],
       },
       async execute(_toolCallId, params) {
         const r = await handleRollback(
           params.target as string | undefined,
           params.workspace as string | undefined,
+          params.numAncestors as number | undefined,
+          params.preview as boolean | undefined,
         );
         return textToolResult(r.text, r.isError);
       },
@@ -164,8 +185,9 @@ export function registerTools(api: OpenClawPluginApi): void {
     {
       name: "ws-ckpt-diff",
       description:
-        "Compare file changes between two snapshots. " +
-        "Always display the FULL untruncated diff. " +
+        "Compare file changes between two snapshots, or between a snapshot " +
+        "and the current workspace state. Omit 'to' to diff against the " +
+        "current workspace. Always display the FULL untruncated diff. " +
         "Do NOT re-interpret or contradict the tool output.",
       parameters: {
         type: "object",
@@ -177,10 +199,10 @@ export function registerTools(api: OpenClawPluginApi): void {
           to: {
             type: "string",
             description:
-              "Target snapshot id or name (defaults to current state)",
+              "Target snapshot id or name. Omit to diff against current workspace state.",
           },
         },
-        required: ["from", "to"],
+        required: ["from"],
       },
       async execute(_toolCallId, params) {
         const r = await handleDiff(

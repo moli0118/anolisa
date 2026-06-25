@@ -914,6 +914,8 @@ mod tests {
                 pinned: false,
                 created_at: chrono::Utc::now(),
                 missing: false,
+                parent_id: None,
+                child_ids: vec![],
             },
         );
         state.register_workspace("ws-abc".to_string(), PathBuf::from("/home/user/ws"), index);
@@ -939,6 +941,8 @@ mod tests {
                 pinned: false,
                 created_at: chrono::Utc::now(),
                 missing: false,
+                parent_id: None,
+                child_ids: vec![],
             },
         );
         state.register_workspace("ws-1".to_string(), PathBuf::from("/ws1"), index);
@@ -970,6 +974,8 @@ mod tests {
             pinned: false,
             created_at: chrono::Utc::now(),
             missing: false,
+            parent_id: None,
+            child_ids: vec![],
         };
 
         let mut idx1 = SnapshotIndex::new(PathBuf::from("/ws1"));
@@ -1263,5 +1269,53 @@ mod tests {
         let _g2 = tokio::time::timeout(Duration::from_millis(100), state.lock_wsid("ws-b"))
             .await
             .expect("different ws_id must not block on each other");
+    }
+
+    #[test]
+    fn reregister_same_wsid_new_path() {
+        let state = DaemonState::new(test_config(), test_backend(), test_state_dir());
+        let path1 = PathBuf::from("/ws/old");
+        let path2 = PathBuf::from("/ws/new");
+        state.register_workspace(
+            "ws-move".to_string(),
+            path1.clone(),
+            SnapshotIndex::new(path1.clone()),
+        );
+        state.register_workspace(
+            "ws-move".to_string(),
+            path2.clone(),
+            SnapshotIndex::new(path2.clone()),
+        );
+
+        // New path resolves to the workspace
+        let arc = state.get_by_path(&path2).unwrap();
+        let ws = arc.try_read().unwrap();
+        assert_eq!(ws.ws_id, "ws-move");
+        assert_eq!(ws.path, path2);
+    }
+
+    #[test]
+    fn path_count_after_reregister() {
+        let state = DaemonState::new(test_config(), test_backend(), test_state_dir());
+        state.register_workspace(
+            "ws-cnt".to_string(),
+            PathBuf::from("/first"),
+            SnapshotIndex::new(PathBuf::from("/first")),
+        );
+        state.register_workspace(
+            "ws-cnt".to_string(),
+            PathBuf::from("/second"),
+            SnapshotIndex::new(PathBuf::from("/second")),
+        );
+
+        let entries = state.collect_workspace_entries();
+        let matching: Vec<_> = entries.iter().filter(|e| e.ws_id == "ws-cnt").collect();
+        // After re-register, all_workspaces should show exactly 1
+        assert_eq!(state.all_workspaces().len(), 1);
+        // collect_workspace_entries may have stale path entries
+        assert!(
+            !matching.is_empty(),
+            "workspace should appear in collected entries"
+        );
     }
 }

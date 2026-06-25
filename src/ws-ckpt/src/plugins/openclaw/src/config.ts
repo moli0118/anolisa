@@ -6,6 +6,7 @@
  */
 
 import type { PluginConfig } from "./types.js";
+import { validateCronExpr } from "./cron.js";
 
 /**
  * Outcome of extracting per-ws effective auto-cleanup state from a
@@ -97,6 +98,7 @@ export function parseWorkspaceCleanupJson(stdout: string): WorkspaceCleanupParse
 export const DEFAULT_CONFIG: PluginConfig = {
   workspace: `${process.env.HOME ?? "/root"}/.openclaw/workspace`,
   autoCheckpoint: false,
+  cronSchedules: [],
 };
 
 // Intentionally no module-level workspaceCleanup cache.
@@ -122,10 +124,18 @@ export class PluginConfigManager {
   /**
    * Create a new PluginConfigManager.
    *
-   * @param userConfig - Partial configuration from the plugin's config file.
+   * @param persistedConfig - Overrides from ~/.openclaw/ws-ckpt.json.
    */
-  constructor(userConfig: Partial<PluginConfig> = {}) {
-    this.config = { ...DEFAULT_CONFIG, ...userConfig };
+  constructor(persistedConfig: Partial<PluginConfig> = {}) {
+    this.config = { ...DEFAULT_CONFIG, ...persistedConfig };
+    if (Array.isArray(this.config.cronSchedules)) {
+      const valid = this.config.cronSchedules.filter((e) => typeof e === "string" && validateCronExpr(e));
+      const skipped = this.config.cronSchedules.filter((e) => typeof e === "string" && !validateCronExpr(e));
+      if (skipped.length > 0) {
+        console.warn(`[ws-ckpt] Ignoring invalid cron expression(s): ${JSON.stringify(skipped)}`);
+      }
+      this.config.cronSchedules = valid;
+    }
   }
 
   /** Return the resolved configuration. */

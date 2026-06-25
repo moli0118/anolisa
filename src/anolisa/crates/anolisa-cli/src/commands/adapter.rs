@@ -41,10 +41,9 @@ use anolisa_core::adapter::driver::{AdapterStatusReport, DriverPlan};
 use anolisa_core::adapter::manager::{
     AdapterManager, DisableOutcome, EnableOutcome, ScanEntry, ScanReport, StatusReport,
 };
-use anolisa_platform::fs_layout::FsLayout;
 
 use crate::commands::common;
-use crate::context::{CliContext, InstallMode};
+use crate::context::CliContext;
 use crate::response::{CliError, render_json};
 
 /// CLI arguments for the `adapter` sub-surface.
@@ -98,6 +97,9 @@ struct ScanRow {
     resource_root: Option<String>,
     driver_available: bool,
     framework_detected: bool,
+    /// The `adapter_type` declared in the component manifest, if any.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    adapter_type: Option<String>,
     enabled: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     claim_status: Option<ClaimStatus>,
@@ -169,21 +171,9 @@ pub fn handle(args: AdapterArgs, ctx: &CliContext) -> Result<(), CliError> {
     }
 }
 
-/// Build a manager for the active layout. A user-mode CLI also searches
-/// the packaged/system datadir so system-installed adapter resources are
-/// still discoverable.
+/// Build a manager for the active layout.
 fn build_manager(ctx: &CliContext) -> AdapterManager {
-    let layout = common::resolve_layout(ctx);
-    let env = anolisa_env::EnvService::detect();
-    let system_datadir = crate::packaged::packaged_datadir_root(&layout);
-    let mut manager = AdapterManager::new(layout, Some(env.home), env.user);
-    if let Some(root) = system_datadir {
-        manager.push_datadir_root(root);
-    }
-    if ctx.install_mode == InstallMode::User {
-        manager.push_state_root(FsLayout::system(ctx.prefix.clone()).state_dir);
-    }
-    manager
+    common::build_adapter_manager(ctx)
 }
 
 // ---------------------------------------------------------------------------
@@ -217,14 +207,15 @@ fn handle_scan(ctx: &CliContext) -> Result<(), CliError> {
         return Ok(());
     }
     println!(
-        "{:<16} {:<10} {:<9} {:<9} {:<9} {:<8} STATE",
-        "COMPONENT", "FRAMEWORK", "DECLARED", "RESOURCE", "DRIVER", "DETECTED"
+        "{:<16} {:<10} {:<14} {:<9} {:<9} {:<9} {:<8} STATE",
+        "COMPONENT", "FRAMEWORK", "TYPE", "DECLARED", "RESOURCE", "DRIVER", "DETECTED"
     );
     for row in &report.entries {
         println!(
-            "{:<16} {:<10} {:<9} {:<9} {:<9} {:<8} {}",
+            "{:<16} {:<10} {:<14} {:<9} {:<9} {:<9} {:<8} {}",
             row.component,
             row.framework,
+            row.adapter_type.as_deref().unwrap_or("-"),
             yes_no(row.declared),
             if row.resource_root.is_some() {
                 "present"
@@ -251,6 +242,7 @@ fn scan_row_from_entry(row: &ScanEntry) -> ScanRow {
             .map(|path| path.display().to_string()),
         driver_available: row.driver_available,
         framework_detected: row.framework_detected,
+        adapter_type: row.adapter_type.clone(),
         enabled: row.enabled,
         claim_status: row.claim_status,
     }
@@ -438,9 +430,12 @@ fn map_err(command: &str, err: AdapterError) -> CliError {
         AdapterError::UnknownPlaceholder { .. }
         | AdapterError::UnknownFramework { .. }
         | AdapterError::AmbiguousFramework { .. }
+        | AdapterError::UnsupportedAdapterType { .. }
+        | AdapterError::InvalidAdapterInput { .. }
         | AdapterError::ComponentNotInstalled { .. }
         | AdapterError::AdapterNotDeclared { .. }
         | AdapterError::ResourceRootNotFound { .. }
+        | AdapterError::ContractResourceRootNotFound { .. }
         | AdapterError::FrameworkNotDetected { .. }
         | AdapterError::BundleInvalid { .. }
         | AdapterError::ClaimValidation(_) => CliError::InvalidArgument {
@@ -540,5 +535,52 @@ mod tests {
             },
         );
         assert!(matches!(err, CliError::Runtime { .. }));
+    }
+
+    #[test]
+    fn unsupported_adapter_type_maps_to_invalid_argument() {
+        let err = map_err(
+            "adapter enable",
+            AdapterError::UnsupportedAdapterType {
+                component: "tokenless".to_string(),
+                framework: "openclaw".to_string(),
+                adapter_type: "skill_bundle".to_string(),
+            },
+        );
+        assert!(matches!(err, CliError::InvalidArgument { .. }));
+    }
+
+    #[test]
+    fn scan_row_includes_adapter_type() {
+        let entry = ScanEntry {
+            component: "tokenless".to_string(),
+            framework: "openclaw".to_string(),
+            declared: true,
+            resource_root: None,
+            driver_available: true,
+            framework_detected: true,
+            adapter_type: Some("plugin".to_string()),
+            enabled: false,
+            claim_status: None,
+        };
+        let row = scan_row_from_entry(&entry);
+        assert_eq!(row.adapter_type.as_deref(), Some("plugin"));
+    }
+
+    #[test]
+    fn scan_row_adapter_type_none_when_not_declared() {
+        let entry = ScanEntry {
+            component: "tokenless".to_string(),
+            framework: "openclaw".to_string(),
+            declared: false,
+            resource_root: Some(std::path::PathBuf::from("/tmp/adapters/tokenless/openclaw")),
+            driver_available: true,
+            framework_detected: true,
+            adapter_type: None,
+            enabled: false,
+            claim_status: None,
+        };
+        let row = scan_row_from_entry(&entry);
+        assert!(row.adapter_type.is_none());
     }
 }

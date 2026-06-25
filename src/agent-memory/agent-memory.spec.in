@@ -44,18 +44,21 @@ Agent memory is a persistent filesystem memory for AI agents, served over
 the MCP (Model Context Protocol) standard. Linux only.
 
 Core Features:
-- MCP Server: 19 tools over stdio JSON-RPC 2.0, in three tiers
+- MCP Server: 25 tools over stdio JSON-RPC 2.0, in three tiers
   - Tier A file ops: mem_read / write / append / edit / list / grep /
     diff / mkdir / remove / promote / mem_session_log
   - Tier B structured: memory_search / memory_observe /
     memory_get_context (hidden from tools/list AND rejected at
-    tools/call with METHOD_NOT_FOUND on the expert profile)
+    tools/call with METHOD_NOT_FOUND on the expert profile) /
+    memory_task_save / memory_task_resume / memory_task_list /
+    memory_task_close
   - Tier C governance: mem_snapshot / mem_snapshot_list /
     mem_snapshot_restore / mem_log / mem_revert
 - Per-namespace mount under ~/.anolisa/memory/<ns>/ with optional Linux
   user-namespace + private tmpfs isolation; openat2(RESOLVE_BENEATH)
   sandbox for every file open
-- SQLite FTS5 BM25 background index (sub-millisecond search)
+- SQLite FTS5 BM25 background index with optional dense-vector
+  semantic search (OpenAI / Ollama embedding backends)
 - Optional git versioning of the mount tree with auto-commit on writes
 - tar.gz snapshots with atomic per-entry rename swap on restore
 - Optional cgroup v2 memory.max self-limit
