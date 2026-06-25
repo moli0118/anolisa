@@ -195,6 +195,12 @@ build-hermes-plugin: ## Stage hermes-plugin Python sources to BUILD_DIR
 	cp -rp hermes-plugin/src/. $(BUILD_DIR)/hermes-plugin/src/
 	cp -rp hermes-plugin/scripts/. $(BUILD_DIR)/hermes-plugin/scripts/
 
+.PHONY: stage-codex-plugin
+stage-codex-plugin: ## Stage codex-plugin hooks and install script to BUILD_DIR
+	install -d -m 0755 $(BUILD_DIR)/codex-plugin
+	cp -rp codex-plugin/hooks-plugin/. $(BUILD_DIR)/codex-plugin/
+	cp -p codex-plugin/install.sh $(BUILD_DIR)/codex-plugin/
+
 .PHONY: stage-cosh-extension
 stage-cosh-extension: ## Stage cosh-extension hooks to BUILD_DIR
 	install -d -m 0755 $(BUILD_DIR)/cosh-extension
@@ -232,7 +238,7 @@ stage-component-manifest: ## Stage component.toml into BUILD_DIR
 		$(BUILD_DIR)/share/anolisa/components/sec-core/component.toml
 
 .PHONY: build-all
-build-all: build-sandbox build-cli build-openclaw-plugin build-hermes-plugin stage-cosh-extension stage-skills stage-adapter-manifest stage-component-manifest ## Build all components
+build-all: build-sandbox build-cli build-openclaw-plugin build-hermes-plugin stage-codex-plugin stage-cosh-extension stage-skills stage-adapter-manifest stage-component-manifest ## Build all components
 	@echo "📦 All artifacts collected to $(BUILD_DIR)/"
 
 .PHONY: export-requirements
@@ -292,6 +298,7 @@ WHEEL_DIR           ?= $(LIBDIR)/wheels
 CLI_STAGED_SITE     ?= $(BUILD_DIR)/site-packages
 CLI_PRIVATE_SITE    ?= /opt/agent-sec/lib/python3.11/site-packages
 RPM_OPENCLAW_PLUGIN_DIR ?= /opt/agent-sec/openclaw-plugin
+RPM_CODEX_PLUGIN_DIR  ?= /opt/agent-sec/codex-plugin
 RPM_HERMES_PLUGIN_DIR ?= /opt/agent-sec/hermes-plugin
 SYSTEMD_USER_UNIT_DIR ?= /usr/lib/systemd/user
 SYSTEMD_USER_UNIT_SOURCE ?= agent-sec-cli/config/systemd/agent-sec-core.service
@@ -367,6 +374,11 @@ install-hermes-plugin: ## Install hermes-plugin to target directory
 	cp -rp $(BUILD_DIR)/hermes-plugin/scripts/. $(DESTDIR)$(HERMES_PLUGIN_DIR)/scripts/
 	chmod 0755 $(DESTDIR)$(HERMES_PLUGIN_DIR)/scripts/*.sh
 
+.PHONY: install-codex-plugin
+install-codex-plugin: ## Install codex-plugin hooks to RPM target
+	install -d -m 0755 $(DESTDIR)$(RPM_CODEX_PLUGIN_DIR)
+	cp -rp $(BUILD_DIR)/codex-plugin/. $(DESTDIR)$(RPM_CODEX_PLUGIN_DIR)/
+
 .PHONY: install-cosh-hook
 install-cosh-hook: ## Install cosh hooks (linux-sandbox + extension)
 	install -d -m 0755 $(DESTDIR)$(BINDIR)
@@ -407,7 +419,7 @@ install-all: install-cli-venv install-cosh-hook install-openclaw-plugin install-
 .PHONY: install-all-for-rpmbuild
 install-all-for-rpmbuild: OPENCLAW_PLUGIN_DIR := $(RPM_OPENCLAW_PLUGIN_DIR)
 install-all-for-rpmbuild: HERMES_PLUGIN_DIR := $(RPM_HERMES_PLUGIN_DIR)
-install-all-for-rpmbuild: install-cli-site install-cosh-hook install-openclaw-plugin install-hermes-plugin install-skills install-adapter-manifest install-component-manifest install-systemd-user ## Install all (RPM build)
+install-all-for-rpmbuild: install-cli-site install-cosh-hook install-codex-plugin install-openclaw-plugin install-hermes-plugin install-skills install-adapter-manifest install-component-manifest install-systemd-user ## Install all (RPM build)
 
 # =============================================================================
 # UNINSTALL
