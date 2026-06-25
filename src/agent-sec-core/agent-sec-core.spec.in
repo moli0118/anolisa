@@ -49,6 +49,7 @@ BuildRequires:  systemd-rpm-macros
 # Metapackage: pull all subpackages
 Requires:       agent-sec-cli = %{version}-%{release}
 Requires:       agent-sec-cosh-hook = %{version}-%{release}
+Requires:       agent-sec-codex-hook = %{version}-%{release}
 Requires:       agent-sec-openclaw-hook = %{version}-%{release}
 Requires:       agent-sec-hermes-hook = %{version}-%{release}
 Requires:       agent-sec-skills = %{version}-%{release}
@@ -177,6 +178,24 @@ Includes skill-ledger, code-scanner, prompt-scanner and related skill definition
 %files -n agent-sec-skills
 %defattr(0644,root,root,0755)
 %{_datadir}/anolisa/skills/
+%license LICENSE
+
+# =============================================================================
+# Subpackage 6: agent-sec-codex-hook
+# =============================================================================
+%package -n agent-sec-codex-hook
+Summary:        Codex plugin security hooks
+Requires:       agent-sec-cli = %{version}-%{release}
+Requires:       python3 >= 3.11
+Requires:       python3 < 3.12
+
+%description -n agent-sec-codex-hook
+Codex security hooks providing code scanning, PII checking, prompt scanning
+and skill ledger verification for Codex agent.
+
+%files -n agent-sec-codex-hook
+%defattr(0644,root,root,0755)
+/opt/agent-sec/codex-plugin/
 %license LICENSE
 
 # =============================================================================
