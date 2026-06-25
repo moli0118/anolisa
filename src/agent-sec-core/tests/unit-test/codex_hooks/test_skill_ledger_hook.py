@@ -504,7 +504,12 @@ class TestSkillCatalog:
         assert "my-tool" in catalog
 
     def test_first_match_wins_priority(self, tmp_path, monkeypatch):
-        """Higher-priority roots take precedence (repo > user)."""
+        """Same name in multiple roots → catalog collects all of them.
+
+        _resolve_skill_dir should return None (ambiguous) for duplicates,
+        matching Codex semantics where plain $skill-name is only used when
+        the name is unique across all roots.
+        """
         # Create project with .git marker and .agents/skills/
         project = tmp_path / "proj"
         project.mkdir()
@@ -525,8 +530,11 @@ class TestSkillCatalog:
         monkeypatch.setenv("CODEX_HOME", str(codex_home))
 
         catalog = skill_ledger_hook._build_skill_catalog(str(project))
-        # Repo-level should win (first in roots order)
-        assert catalog["dup-skill"] == str(repo_skill.resolve())
+        # Both directories should be collected
+        assert len(catalog["dup-skill"]) == 2
+        # Resolve should return None (ambiguous)
+        result = skill_ledger_hook._resolve_skill_dir("dup-skill", catalog)
+        assert result is None
 
     def test_catalog_from_parent_walk_up(self, tmp_path, monkeypatch):
         """Skills in project root .agents/skills/ found from subdir."""
@@ -543,7 +551,7 @@ class TestSkillCatalog:
 
         catalog = skill_ledger_hook._build_skill_catalog(str(cwd))
         assert "parent-skill" in catalog
-        assert str(skill_dir.resolve()) == catalog["parent-skill"]
+        assert str(skill_dir.resolve()) in catalog["parent-skill"]
 
     def test_symlink_traversal_excluded(self, tmp_path, monkeypatch):
         """Symlink pointing outside skill root is excluded from catalog."""
