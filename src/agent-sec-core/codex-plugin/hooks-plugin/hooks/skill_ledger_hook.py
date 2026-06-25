@@ -204,17 +204,18 @@ def _parse_skill_name(skill_md_path: Path) -> str | None:
     return None
 
 
-def _build_skill_catalog(cwd: str) -> dict[str, str]:
-    """Build {canonical_name: dir_path} catalog from all skill roots.
+def _build_skill_catalog(cwd: str) -> dict[str, list[str]]:
+    """Build {canonical_name: [dir_path, ...]} catalog from all skill roots.
 
     Scans each root's immediate subdirectories for SKILL.md, reads the
     frontmatter name field. Falls back to directory name if no name field.
-    First match wins (higher-priority roots first).
+    A name may map to multiple directories (e.g. same skill installed in
+    both repo-level and user-level roots).
 
     Security: after resolving symlinks, verifies the resolved path is still
     within the skill root boundary (prevents path traversal via symlinks).
     """
-    catalog: dict[str, str] = {}
+    catalog: dict[str, list[str]] = {}
     for root in _skill_roots(cwd):
         if not root.is_dir():
             continue
@@ -240,14 +241,30 @@ def _build_skill_catalog(cwd: str) -> dict[str, str]:
             if not skill_md.is_file():
                 continue
             name = _parse_skill_name(skill_md) or entry.name
-            if name not in catalog:
-                catalog[name] = str(resolved_entry)
+            catalog.setdefault(name, []).append(str(resolved_entry))
     return catalog
 
 
-def _resolve_skill_dir(skill_name: str, catalog: dict[str, str]) -> str | None:
-    """Resolve a skill name using the pre-built catalog."""
-    return catalog.get(skill_name)
+def _resolve_skill_dir(skill_name: str, catalog: dict[str, list[str]]) -> str | None:
+    """Resolve a skill name using the pre-built catalog.
+
+    Returns the directory path only when the name uniquely maps to a single
+    directory.  Codex treats a plain $skill-name as ambiguous when the same
+    name exists in multiple roots, so we fail-open in that case to avoid
+    checking a directory that Codex might not actually inject.
+    """
+    dirs = catalog.get(skill_name)
+    if not dirs:
+        return None
+    if len(dirs) == 1:
+        return dirs[0]
+    # Ambiguous: same name in multiple roots – fail-open with warning
+    print(
+        f"[skill-ledger] ⚠ skill '{skill_name}' found in {len(dirs)} "
+        f"roots, skipping check (ambiguous)",
+        file=sys.stderr,
+    )
+    return None
 
 
 # -- prompt parsing --------------------------------------------------------
